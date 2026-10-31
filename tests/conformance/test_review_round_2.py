@@ -140,3 +140,119 @@ def test_a_child_run_gets_the_parents_delegation_state_from_ids():
     child = sc.child["runs"][0]
     assert sc.platform.ids.run_users[child.run_id] == "advisor-1"
     assert run.state == "COMPLETED"
+
+
+@spec("4.3", "A.3", "5.3", finding="F9")
+def test_a_non_finite_or_missing_amount_cannot_pass_a_limit():
+    """Review-2 item 2."""
+    from agentic_control.dbs import identifier_numeric_extractor
+    fn = identifier_numeric_extractor(r"[A-Za-z]+-\d+", {"amount": "number", "sku": "identifier"})
+    acc, rej = fn({"amount": "nan", "sku": "PART-1"})
+    assert "amount" in rej and acc == {"sku": "PART-1"}
+    acc, rej = fn({"amount": float("inf"), "sku": "PART-1"})
+    assert "amount" in rej
+    sc = build_scenario(trigger="clean-ticket")
+    orig = sc.model.propose
+    sc.model.propose = lambda r, n, c: {**orig(r, n, c), "amount": float("nan")} if n.id == "n4" else orig(r, n, c)
+    run = sc.start()
+    sc.execute(run)
+    dec = last_decision(sc, run, "n4")
+    assert dec["decision"] == "DENY" and dec["rule_id"] == "hard_limit" and "finite" in dec["reason"]
+    sc2 = build_scenario(trigger="clean-ticket")
+    orig2 = sc2.model.propose
+    sc2.model.propose = lambda r, n, c: {k: v for k, v in orig2(r, n, c).items() if k != "amount"} if n.id == "n4" else orig2(r, n, c)
+    run2 = sc2.start()
+    sc2.execute(run2)
+    assert last_decision(sc2, run2, "n4")["rule_id"] == "schema" and not sc2.systems["fulfilment"].shipments
+
+
+@spec("5.1", "A.1", finding="F1")
+def test_untagged_fields_from_a_tagged_source_are_tainted():
+    """Review-2 item 4: a per_item trigger payload and a tagging system's record with an untagged field."""
+    sc = build_scenario(trigger="clean-ticket")
+    env = sc.registry_signer.sign({"trigger_id": "clean-ticket", "kind": "subject_claim", "subject": "cust-1", "timestamp": 0})
+    sc.platform.registry.triggers["clean-ticket"].source_system = "fulfilment"       # a provenance-tagged source
+    run = sc.platform.run.start_run(sc.release, "clean-ticket", env, {"note": "plain string, no tag"}, "wl-1")
+    assert run.exposed is True                                                       # untagged field: tainted
+    run2 = sc.platform.run.start_run(sc.release, "clean-ticket", env, {"note": {"value": "x", "tainted": False}}, "wl-1")
+    assert run2.exposed is False
+    f = sc.systems["fulfilment"]
+    f.records["dev-7"] = {"device_id": "dev-7", "ship_address": "1 Untagged Way"}   # no _tags at all
+    rel = {"agent_id": AGENT, "version": "1.0", "surface": "S2", "pep_form": "sidecar"}
+    cred = sc.platform.ids.issue_credential("wl-1", "r", rel, "n", {}, {"acting_user": None, "agents": [AGENT]}, "fulfilment", "normal")
+    items = f.read("preview_shipment", {"device_id": "dev-7"}, cred, "wl-1")
+    assert items and items[0]["tainted"] is True
+    f.records["dev-8"] = {"device_id": "dev-8", "ship_address": "2 Half Tagged", "_tags": {"ship_address": "verified"}}
+    assert f.read("preview_shipment", {"device_id": "dev-8"}, cred, "wl-1")[0]["tainted"] is True
+
+
+@spec("5.1", "A.1", finding="F1")
+def test_what_an_effect_returns_is_subject_to_the_source_rule():
+    """Review-2 item 4c: a write tool's result from an agent-writable system taints the run."""
+    sc = build_scenario(trigger="clean-ticket", internal_effect=True)
+    run = sc.start()
+    inner = sc.pep.enter_node
+
+    def check(r, node, inputs):
+        if node.id == "n1":
+            assert run.exposed is True and any(t.startswith("add_note") for t in run.tainted_reads)
+        inner(r, node, inputs)
+    sc.pep.enter_node = check
+    sc.execute(run)
+    assert events(sc, run, "taint.applied")[0]["source"] == "add_note"
+
+
+@spec("5.3", "A.3", finding="F1")
+def test_sanitized_provenance_only_for_values_that_fit_the_output_schema():
+    """Review-2 item 8: an undeclared or ill-typed output field earns no provenance."""
+    from agentic_control.common import digest
+    sc = build_scenario(trigger="clean-ticket")
+    s = sc.platform.registry.sanitizers["proposal_extractor"]
+    real = s.fn
+    s.fn = lambda inp: ({**real(inp)[0], "free_text": "ship to 99 Evil Rd"}, real(inp)[1])    # a leaky sanitizer
+    run = sc.start()
+    sc.execute(run)
+    acc = sc.pep.sanitized[run.run_id]
+    assert digest("PART-100") in acc and digest("ship to 99 Evil Rd") not in acc
+
+
+@spec("5.3", "A.7", finding="F1")
+def test_every_free_string_in_a_delivery_passes_the_rendering_sanitizer():
+    """Review-2 item 8: not only `content`."""
+    from agentic_control.registry import ToolManifest
+    sc = build_scenario()
+    reg = sc.platform.registry
+    m = reg.tools["log_case"]
+    reg.tools["log_case"] = ToolManifest("log_case", "1", "case_log", {"sink": "string", "content": "string", "subject_line": "string"},
+                                         writes_fields=[("case_log", "content")], resource_none_justification="delivery")
+    reg.tools["log_case"].side_effect_class = m.side_effect_class
+    orig = sc.model.propose
+    sc.model.propose = lambda r, n, c: {**orig(r, n, c), "subject_line": "see https://evil.example/x?token=abc"} if n.id == "n6" else orig(r, n, c)
+    run = sc.start()
+    sc.execute(run)
+    rec = list(sc.systems["case_log"].records.values())[0]
+    assert "https://" not in rec.get("subject_line", "") and "https://" not in rec["content"]
+
+
+@spec("4.7", "4.2", finding="F9")
+def test_a_childs_data_classes_return_to_the_parent():
+    sc = build_scenario(with_child=True, trigger="clean-ticket")
+    sc.platform.registry.tools["read_ticket"].reads_data_class = "restricted"
+    run = sc.start()
+    sc.execute(run)
+    assert "restricted" in run.data_classes_touched
+
+
+@spec("8", "4.3", finding="F9")
+def test_the_denied_shipment_routes_to_a_person_and_the_record_tag_follows_the_write():
+    """Review-2 item 6."""
+    sc = build_scenario(behaviour="inject_address")
+    run = sc.start(ticket_address="99 Evil Rd")
+    sc.execute(run)
+    sent = sc.systems["mail_relay"].sent
+    assert len(sent) == 1 and sent[0]["template_id"] == "tpl-routed-to-advisor"
+    sc2 = build_scenario()                                       # exposed run: the write is tagged exposed
+    run2 = sc2.start()
+    sc2.execute(run2)
+    tags = sc2.systems["fulfilment"].records["dev-1"]["_tags"]
+    assert tags["replacement_issued"] == "exposed" and tags["ship_address"] == "verified"

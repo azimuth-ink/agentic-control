@@ -101,7 +101,7 @@ def test_approval_timeout_denies_on_RUNs_clock():
     sc.platform.clock.advance(3601)
     sc.platform.run.tick()
     assert events(sc, run, "hold.resolved", "n4")[-1]["outcome"] == "timeout"
-    assert run.state == "RUNNING" and run.next_node == "n5"
+    assert run.state == "RUNNING" and run.next_node == "n5d"
 
 
 @spec("4.4", "4.5", "A.5", finding="F2")

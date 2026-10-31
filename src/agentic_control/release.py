@@ -105,6 +105,7 @@ class Node(Record):
     input_role: str | None = None           # human nodes: registered input role
     denial_branch: str | None = None        # node id to continue at on deny/timeout; None = end run on the branch
     failure_branch: str | None = None
+    next: str | None = None                 # explicit successor; None = the next forward node in graph order
     target_agent: str | None = None         # handoff/service
     sanitizer: str | None = None            # sanitize nodes
     reverses: str | None = None             # compensate nodes: the effect node reversed
@@ -156,6 +157,8 @@ class Release(Record):
         fwd = self.forward_nodes()
         for i, n in enumerate(fwd):
             if n.id == node_id:
+                if n.next is not None:
+                    return n.next
                 return fwd[i + 1].id if i + 1 < len(fwd) else None
         return None
 

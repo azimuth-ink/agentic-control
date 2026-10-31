@@ -6,6 +6,8 @@ bundle and returns ALLOW, DENY(reason), or HOLD(hold_causes, approver_set, subst
 obligations. The first DENY is final; a HOLD is final only if no later rule denies."""
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -196,8 +198,11 @@ class PolicyDecisionPoint(Availability):
         # 4. hard limits (normal effects)
         limit = next((b for b in node.bounds if b.form == "limit"), None)
         amount = rq.parameters.get(limit.param) if limit else None
-        if rq.purpose == "normal" and node.type == "effect" and limit and limit.hard is not None and amount is not None and amount > limit.hard:
-            return Decision("DENY", "hard_limit", f"{limit.param} above the hard limit")
+        if rq.purpose == "normal" and node.type == "effect" and limit and limit.param in m.schema:
+            if not isinstance(amount, (int, float)) or isinstance(amount, bool) or not math.isfinite(amount):
+                return Decision("DENY", "hard_limit", f"{limit.param} is not a finite number")
+            if limit.hard is not None and amount > limit.hard:
+                return Decision("DENY", "hard_limit", f"{limit.param} above the hard limit")
         # 5. compensation: terminal
         if rq.purpose == "compensation":
             return self._decide_compensation(rq)

@@ -19,7 +19,7 @@ from .evidence import EvidenceStore, Journal
 from .identity import IdentityService
 from .policy import Decision, DecisionRequest, PolicyBundle, PolicyDecisionPoint, StopList, _op, apply_mapping
 from .registry import Registry, ToolManifest
-from .release import Node, scope_only
+from .release import Node, anchored_params, scope_only
 
 COUNTER_WINDOW = 3600.0
 MANIFEST_TTL = 3600.0        # how long a cached manifest serves during a REG outage (deployment content)
@@ -33,6 +33,9 @@ def _schema_mismatch(m: ToolManifest, params: dict[str, Any]) -> str | None:
     A sanitizer's input is untrusted by definition and is checked by the sanitizer itself."""
     if m.is_sanitizer:
         return None
+    missing = [k for k in m.schema if k not in params]
+    if missing:
+        return f"parameters {missing} of {m.tool_id} are missing"
     for k, v in params.items():
         if k.startswith("__"):
             continue
@@ -534,7 +537,8 @@ class EnforcementPoint:
             raise NodeFailed(f"credential refused: {e}")
         if m.side_effect_class == "internal_store":
             tag = "exposed" if run.exposed else "clean"
-            return system.execute(m.tool_id, params, cred, self.workload, tag=tag)
+            res = system.execute(m.tool_id, params, cred, self.workload, tag=tag)
+            return self._apply_read_result(run, node, m, [dict(res)])[0] if isinstance(res, dict) else res
         items = system.read(m.tool_id, params, cred, self.workload)
         return self._apply_read_result(run, node, m, items)
 
@@ -552,8 +556,9 @@ class EnforcementPoint:
                           "accepted_ref": self._payload(accepted), "rejected_ref": self._payload(rejected)})
         if s.qualifies_for_sanitized_provenance:
             bucket = self.sanitized.setdefault(run.run_id, set())
-            for v in accepted.values():
-                bucket.add(digest(v))
+            for k, v in accepted.items():
+                if s.value_fits(k, v):          # an undeclared or ill-typed output field earns no provenance
+                    bucket.add(digest(v))
         return accepted
 
     def _no_factor(self, run: Run, factors: set[str], chain: dict[str, Any] | None = None) -> bool:
@@ -684,6 +689,9 @@ class EnforcementPoint:
                           "result_ref": self._payload(result), "idempotency_key": idem, "recorded_by": "pep", "action_hash": rq.action_hash})
         if reservation:
             self.run.confirm(reservation)
+        # what a tool returns is subject to the same source rule as a read (5.1)
+        if isinstance(result, dict):
+            self._apply_read_result(run, node, m, [dict(result)])
         mapping = m.compensation if isinstance(m.compensation, dict) else {}
         result_fields = {ref.split(".", 1)[1]: result.get(ref.split(".", 1)[1]) for ref in mapping.get("params", {}).values() if ref.startswith("result.")}
         self.run.effect_confirmed(run, EffectRecord(node.id, rq.action_hash, decision_event, params, result_fields, self._payload(result), [], m.tool_id))
@@ -760,11 +768,18 @@ class EnforcementPoint:
                 self._write(run, {"type": "delivery.failed", "node_id": node.id, "sink": sink, "sanitizer_applied": False, "error": "no rendering sanitizer registered"})
                 self._denied(run, node)
                 raise Denied("no rendering sanitizer registered")
-            acc, rej = s.fn({"content": params.get("content", "")})
-            content = {**params, "content": acc["content"]}
+            # every free string passes through the renderer; the anchored sink or recipient is a declared field
+            anchored = anchored_params(node.bounds, run.release.scope_names()) | {"recipient", "sink"}
+            content, acc_all, rej_all = dict(params), {}, {}
+            for k, v in params.items():
+                if k in anchored or not isinstance(v, str):
+                    continue
+                acc, rej = s.fn({"content": v})
+                content[k] = acc["content"]
+                acc_all[k] = acc["content"]; rej_all[k] = rej
             sanitized = True
             self._write(run, {"type": "sanitize.result", "node_id": node.id, "sanitizer": s.sanitizer_id, "version": s.version,
-                              "accepted_ref": self._payload(acc), "rejected_ref": self._payload(rej)})
+                              "accepted_ref": self._payload(acc_all), "rejected_ref": self._payload(rej_all)})
         tag = "exposed" if run.exposed else "clean"
         try:
             cred = self._credential(run, node, m, "normal", rq.action_hash)
@@ -788,7 +803,9 @@ class EnforcementPoint:
             self._denied(run, node)
             raise Denied(d.reason or "spawn denied")
         child = self.run.spawn(run, node, params)
-        # synchronous: the child's final exposure comes back and the parent's PEP applies the taint
+        # synchronous: the child's final exposure and the data classes it touched come back; the parent's
+        # PEP applies the taint (4.7; the classes so a later delivery is judged on what the child returned)
+        self._update_state(run, {"data_classes_touched": sorted(child.data_classes_touched)})
         if child.exposed:
             self._update_state(run, {"exposed": True, "tainted_reads": [f"child:{child.run_id}"]})
             self._write(run, {"type": "taint.applied", "source": f"child:{child.run_id}", "items": [node.id]})
