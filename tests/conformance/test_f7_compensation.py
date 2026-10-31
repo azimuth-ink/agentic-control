@@ -82,7 +82,7 @@ def test_cancellation_compensates_executed_effects_in_reverse_order():
 @spec("4.9", "A.5", finding="F7")
 def test_cancellation_reverses_in_order_when_every_effect_is_reversible():
     sc = build_scenario(trigger="clean-ticket", internal_effect=True)
-    sc.release.nodes[:] = [n for n in sc.release.nodes if n.id != "n5"]
+    sc.release.nodes[:] = [n for n in sc.release.nodes if n.id not in {"n5", "n5d"}]
     sc.release.node("n4").denial_branch = "n6"
     run = sc.start()
     sc.execute(run)
@@ -101,7 +101,7 @@ def test_cancellation_reverses_in_order_when_every_effect_is_reversible():
 @spec("4.9", "A.5", finding="F7")
 def test_a_failed_compensation_parks_the_run():
     sc = build_scenario(trigger="clean-ticket", internal_effect=True)
-    sc.release.nodes[:] = [n for n in sc.release.nodes if n.id != "n5"]
+    sc.release.nodes[:] = [n for n in sc.release.nodes if n.id not in {"n5", "n5d"}]
     sc.release.node("n4").denial_branch = "n6"
     run = sc.start()
     sc.execute(run)

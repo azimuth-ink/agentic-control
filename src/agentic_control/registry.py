@@ -7,6 +7,9 @@ derived here, never authored: `agent_writable`, `external_ingress` through `sour
 registrations change and stamps on each release."""
 from __future__ import annotations
 
+import math
+import re
+
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -134,6 +137,21 @@ class Sanitizer(Record):
     input_schema: dict[str, str]
     output_schema: dict[str, str]              # field -> int | number | bool | enum:<a,b> | identifier:<regex> | string
     rendering: bool = False
+
+    def value_fits(self, field_name: str, value: Any) -> bool:
+        """Whether an accepted value fits the declared output schema of its field (5.3)."""
+        kind = self.output_schema.get(field_name)
+        if kind is None:
+            return False
+        if kind in {"int", "number"}:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+        if kind == "bool":
+            return isinstance(value, bool)
+        if kind.startswith("enum:"):
+            return str(value) in kind[5:].split(",")
+        if kind.startswith("identifier:"):
+            return isinstance(value, str) and re.fullmatch(kind[len("identifier:"):], value) is not None
+        return isinstance(value, str)       # string
 
     @property
     def qualifies_for_sanitized_provenance(self) -> bool:

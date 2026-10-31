@@ -173,7 +173,7 @@ def test_revoked_at_redemption_with_substitution_forbidden_is_a_denial(monkeypat
     res = sc.platform.ops.approve(run, "n4", "approver-1")
     assert res["status"] == "denied"
     assert events(sc, run, "effect.failed", "n4")[-1]["error"] == "revoked"
-    assert run.next_node == "n5"
+    assert run.next_node == "n5d"
 
 
 @spec("A.6", "4.4", finding="F4")

@@ -47,7 +47,7 @@ def test_deny_has_the_same_guards_as_approve_and_is_deferred_while_parked():
     assert run.state == "PARKED" and run.holds["n4"].status == "resolved"
     with pytest.raises(Refused):
         sc.platform.ops.deny(run, "n4", "approver-1")              # no open hold any more
-    assert sc.platform.run.recover(run) == "RUNNING" and run.next_node == "n5"
+    assert sc.platform.run.recover(run) == "RUNNING" and run.next_node == "n5d"
     sc.execute(run)
     assert run.state == "COMPLETED" and not sc.systems["fulfilment"].shipments
 

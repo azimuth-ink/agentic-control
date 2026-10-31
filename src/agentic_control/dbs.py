@@ -5,6 +5,7 @@ Everything here is reached through the PEP as tools: retrieval, memory, derived 
 delivery tools (to an interface or a sink store), and the outbound data-loss check."""
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Callable
 
@@ -64,10 +65,29 @@ class System(Availability):
         for k, rec in self.records.items():
             if all(rec.get(p) == v for p, v in params.items() if p in rec):
                 item = dict(rec)
-                tags = rec.get("_tags", {})
-                item["tainted"] = any(t in {"untrusted", "exposed"} for t in tags.values()) if self.tagging else False
+                if self.tagging:
+                    item["tainted"] = self._item_tainted(rec)
+                # a system that does not tag returns items without a flag; the PEP applies the source rule
                 out.append(item)
         return out
+
+    def _item_tainted(self, rec: dict[str, Any]) -> bool:
+        """An item is tainted if any field carries an untrusted or exposed tag, or no tag at all (A.1:
+        any untagged field from a provenance-tagged source is treated as tainted)."""
+        tags = rec.get("_tags", {})
+        for f_ in rec:
+            if f_ in {"_tags", "tainted"}:
+                continue
+            if tags.get(f_) in (None, "untrusted", "exposed"):
+                return True
+        return False
+
+    def tagged_result(self, result: dict[str, Any], tag: str | None) -> dict[str, Any]:
+        """A tagging system flags the result it returns for an effect: tainted when the write carried an
+        exposed or untrusted tag, clean when the system itself produced every field."""
+        if not self.tagging:
+            return result
+        return {**result, "tainted": tag in {"untrusted", "exposed"}}
 
     def execute(self, tool: str, params: dict[str, Any], credential: dict[str, Any] | None, presenter: str,
                 purpose: str = "normal", action_hash: str | None = None, idempotency_key: str | None = None,
@@ -83,7 +103,7 @@ class System(Availability):
         if self.fail_next == "indeterminate":
             self.fail_next = None
             raise Indeterminate("timeout")
-        result = self.apply(tool, params, tag)
+        result = self.tagged_result(self.apply(tool, params, tag), tag)
         self.calls.append({"tool": tool, "params": dict(params), "purpose": purpose, "result": result})
         if idempotency_key and self.idempotent:
             self.seen_keys[idempotency_key] = result
@@ -104,7 +124,10 @@ class System(Availability):
         return {"would_change": params}
 
     def write_record(self, key: str, rec: dict[str, Any], tag: str | None) -> None:
-        r = dict(rec)
+        """Merges the written fields into the record; a tagging system tags exactly the fields written,
+        leaving the tags of untouched fields (a verified address stays verified)."""
+        existing = {k: v for k, v in self.records.get(key, {}).items() if k != "_tags"}
+        r = {**existing, **rec}
         if self.tagging:
             tags = dict(self.records.get(key, {}).get("_tags", {}))
             for f_ in rec:
@@ -205,9 +228,14 @@ def identifier_numeric_extractor(pattern: str, fields: dict[str, str]) -> Callab
                     rejected[f_] = v
             elif kind == "number":
                 try:
-                    accepted[f_] = float(v)
+                    n = float(v)
                 except (TypeError, ValueError):
                     rejected[f_] = v
+                    continue
+                if isinstance(v, bool) or not math.isfinite(n):
+                    rejected[f_] = v          # nan and inf compare false against every limit
+                else:
+                    accepted[f_] = n
         return accepted, rejected
 
     return fn

@@ -230,7 +230,9 @@ class RunCoordinator(Availability):
                     raise Refused("user_session trigger without a session token")
                 run.acting_user = self.ids.exchange(session_token, run.run_id)["acting_user"]
             trust = self.registry.payload_trust(trig)
-            run.exposed = trust == "untrusted" or (trust == "per_item" and any(v.get("tainted") for v in payload.values() if isinstance(v, dict)))
+            # per_item payload: a field is clean only when the source tagged it clean; an untagged field is tainted (A.1)
+            run.exposed = trust == "untrusted" or (trust == "per_item" and any(
+                not (isinstance(v, dict) and v.get("tainted") is False) for v in payload.values()))
             run.agents = [release.agent_id]
         else:
             run.subject = parent.subject
