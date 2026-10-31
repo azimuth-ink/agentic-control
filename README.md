@@ -1,6 +1,6 @@
 # agentic-control
 
-Reference implementation of the **Agentic Control Architecture v1.0** — a control plane for agents that act on enterprise systems under delegated authority. The specification and its design rationale are the normative documents; this repository is an executable reading of them: nine in-process components with the contracts of Appendix A, the worked flow of section 8 as a runnable example, and a conformance suite that reproduces the nine findings (F1–F9) the specification's verification rounds were organised around.
+Reference implementation of the **Agentic Control Architecture v1.0** — a control plane for agents that act on enterprise systems under delegated authority. The specification and its design rationale (under `spec/`) are the normative documents; this repository is an executable reading of them: nine in-process components with the contracts of Appendix A, the worked flow of section 8 as a runnable example, and a conformance suite that reproduces the nine findings (F1–F9) the specification's verification rounds were organised around.
 
 Status: pre-release (0.1.0). Nothing depends on it. The interfaces follow the specification's appendix names and will move with the specification.
 
@@ -26,6 +26,8 @@ src/agentic_control/
   gateway.py      MGW (A.8) and OPS (A.9)
   runtime.py      a minimal agent runtime that walks a release graph through the PEP
   platform.py     wiring; outage toggles for the degradation tests
+spec/               the specification, its design rationale, and the v1.1 deferral list (the normative text)
+docs/               spec map, conformance matrix, ADRs, and the architecture field guide (field-guide.html)
 examples/warranty/  the section-8 worked flow with adversarial model behaviours and graph variants
 tests/conformance/  F1–F9, each test marked with the specification clauses it covers
 tests/unit/         primitives

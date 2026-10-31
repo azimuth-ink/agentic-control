@@ -1,0 +1,25 @@
+{
+  "title": "agentic-control: reference implementation of the Agentic Control Architecture",
+  "version": "0.1.0",
+  "upload_type": "software",
+  "description": "Reference implementation of the Agentic Control Architecture v1.0, a control plane for agents acting on enterprise systems under delegated authority: nine components (registry, identity, policy decision, policy enforcement, run coordination, evidence, data boundary, model gateway, operations) with the contracts of the specification's Appendix A, the worked warranty-replacement flow of section 8 as a runnable example, and a conformance suite organised around the nine findings of the specification's verification record. Specification and design rationale included under spec/ (prose: CC0 1.0; code: Apache-2.0).",
+  "creators": [
+    {
+      "name": "Gray, Jeff",
+      "orcid": "0009-0005-6796-6576",
+      "affiliation": "Independent"
+    }
+  ],
+  "license": "Apache-2.0",
+  "keywords": [
+    "LLM agents",
+    "agent governance",
+    "policy enforcement",
+    "delegated authority",
+    "evidence",
+    "control plane",
+    "reference architecture",
+    "conformance",
+    "defensive publication"
+  ]
+}
