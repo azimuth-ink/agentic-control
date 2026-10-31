@@ -61,7 +61,7 @@ class Fulfilment(System):
             return {"shipment_id": sid, "status": "cancelled"}
         raise NotImplementedError(tool)
 
-    def preview(self, params: dict[str, Any]) -> dict[str, Any]:
+    def preview_of(self, params: dict[str, Any]) -> dict[str, Any]:
         return {"would_ship": params.get("part_sku"), "to": params.get("destination"), "value": params.get("amount"), "tainted": False}
 
 
@@ -128,8 +128,11 @@ class WarrantyModel:
             return dict(ctx["outputs"].get("n2", {}))
         if node.id == "n4":
             s = ctx["outputs"].get("n3", {})
+            raw = ctx["outputs"].get("n2", {})
             dest = self.ticket_address if self.behaviour == "inject_address" and self.ticket_address else "12 Main St"
-            return {"device_id": s.get("device_id"), "part_sku": s.get("part_sku"), "amount": s.get("amount"), "destination": dest}
+            # what the sanitizer rejected, the model "remembers" from its own proposal: model provenance
+            return {"device_id": s.get("device_id", raw.get("device_id")), "part_sku": s.get("part_sku", raw.get("part_sku")),
+                    "amount": s.get("amount", raw.get("amount")), "destination": dest}
         if node.id == "n5":
             return {"template_id": "tpl-shipped", "destination": self.ticket_address if self.behaviour == "inject_reply" else "cust@example.com"}
         if node.id == "n6":

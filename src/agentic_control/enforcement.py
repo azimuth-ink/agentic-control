@@ -17,11 +17,31 @@ from .crypto import TrustStore
 from .dbs import DLP, Indeterminate, System, SystemRefused
 from .evidence import EvidenceStore, Journal
 from .identity import IdentityService
-from .policy import Decision, DecisionRequest, PolicyBundle, PolicyDecisionPoint, StopList, apply_mapping
+from .policy import Decision, DecisionRequest, PolicyBundle, PolicyDecisionPoint, StopList, _op, apply_mapping
 from .registry import Registry, ToolManifest
 from .release import Node, scope_only
 
 COUNTER_WINDOW = 3600.0
+
+
+_TYPES = {"string": (str,), "number": (int, float), "boolean": (bool,), "object": (dict,), "array": (list,)}
+
+
+def _schema_mismatch(m: ToolManifest, params: dict[str, Any]) -> str | None:
+    """A call whose parameters do not fit the manifest's schema is refused before anything is reserved.
+    A sanitizer's input is untrusted by definition and is checked by the sanitizer itself."""
+    if m.is_sanitizer:
+        return None
+    for k, v in params.items():
+        if k.startswith("__"):
+            continue
+        t = m.schema.get(k)
+        if t is None:
+            return f"parameter {k} is not in the schema of {m.tool_id}"
+        want = _TYPES.get(t)
+        if want and (not isinstance(v, want) or (t == "number" and isinstance(v, bool))):
+            return f"parameter {k} is not a {t}"
+    return None
 
 
 class Held(Exception):
@@ -242,11 +262,11 @@ class EnforcementPoint:
 
     def _request(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any], purpose: str, counters: dict[str, int],
                  approval_ref: dict[str, Any] | None = None, original_ref: dict[str, Any] | None = None,
-                 preview_instructed: bool = False) -> DecisionRequest:
+                 preview_instructed: bool = False, chain: dict[str, Any] | None = None) -> DecisionRequest:
         factors = self.registry.derive_factors(m, params) if purpose in {"normal", "replay", "compensation"} and m.side_effect_class != "none" else set()
         state = run.run_state()
         return DecisionRequest(
-            purpose=purpose, principal_chain=run.principal_chain, agent=run.agent_id, release=run.release, run=run.run_id,
+            purpose=purpose, principal_chain=chain or run.principal_chain, agent=run.agent_id, release=run.release, run=run.run_id,
             trace=run.trace_id, node=node, tool=m, parameters=params, provenance=self._provenance(run, node, m, params),
             action_hash=self._action_hash(m, params, run, node.id), subject=run.subject, run_state=state,
             counters=counters, factors=factors, stop_list_seq=self.stop_list.sequence if self.stop_list else 0,
@@ -284,9 +304,20 @@ class EnforcementPoint:
             raise Unavailable("PDP")
         if rq.tool.tool_id not in rq.node.declared_tools():
             return Decision("DENY", "node_declaration", "undeclared tool")
+        # intersection from the cached bundle: an agents-only chain is evaluable without the PDP (A.3)
+        for agent in rq.principal_chain.get("agents", []):
+            ent = self.bundle.entitlements.get(agent, {})
+            if rq.tool.tool_id not in ent.get("tools", []):
+                return Decision("DENY", "intersection", f"{agent} not entitled to tool {rq.tool.tool_id}")
+            if rq.tool.target_system in self.registry.systems and rq.tool.target_system not in ent.get("systems", []):
+                return Decision("DENY", "intersection", f"{agent} not entitled to system {rq.tool.target_system}")
         for b in rq.node.bounds:
+            if b.param and b.param not in rq.tool.schema:
+                continue
             if b.form == "in_scope" and rq.parameters.get(b.param) not in (run.release.scopes.get(b.scope) or []):
                 return Decision("DENY", "bounds", f"{b.param} not in scope")
+            if b.form == "op" and not _op(rq.parameters.get(b.param), b.op, b.const):
+                return Decision("DENY", "bounds", f"{b.param} {b.op} {b.const} failed")
             if b.form == "limit":
                 v = rq.parameters.get(b.param, 0)
                 if not isinstance(v, (int, float)):
@@ -389,6 +420,12 @@ class EnforcementPoint:
             self._decision_event(run, node, rq, d, None, {}, None, None)
             self._denied(run, node)
             raise Denied(d.reason or "undeclared tool")
+        bad = _schema_mismatch(m, params)
+        if bad:
+            rq = self._request(run, node, m, params, "normal", {})
+            d = Decision("DENY", "schema", bad)
+            self._decision_event(run, node, rq, d, None, {}, None, None)
+            raise Denied(bad)
         # step cap for loop nodes
         c = self.step_counts.get((run.run_id, node.id), 0) + 1
         self.step_counts[(run.run_id, node.id)] = c
@@ -404,9 +441,20 @@ class EnforcementPoint:
             return self._read(run, node, m, params)
         return self._effect(run, node, m, params)
 
+    def _down(self) -> str | None:
+        """The first control-plane component the PEP can see is unavailable, else None."""
+        for comp in (self.evs, self.pdp, self.run, self.ids):
+            if not comp.available:
+                return comp.name
+        return None
+
     def _read(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any]) -> Any:
-        if m.reads_data_class == "restricted" and self._stopped(run, m.tool_id):
-            raise Denied("restricted read refused under a stop")
+        if m.reads_data_class == "restricted":
+            if self._stopped(run, m.tool_id):
+                raise Denied("restricted read refused under a stop")
+            down = self._down()
+            if down:
+                raise Unavailable(down)          # reads of restricted data stop under every outage (6.1)
         rq = self._request(run, node, m, params, "normal", {})
         d = self._decide(rq, run)
         self._decision_event(run, node, rq, d, None, {}, None, None)
@@ -415,10 +463,16 @@ class EnforcementPoint:
                 self._denied(run, node)
             raise Denied(d.reason or "read denied")
         system = self.systems[m.target_system]
+        try:
+            cred = self._credential(run, node, m, "normal", rq.action_hash)
+        except Refused as e:
+            # no credential, no call: the node fails on its failure branch (or ends the run on it)
+            self._failed(run, node)
+            raise NodeFailed(f"credential refused: {e}")
         if m.side_effect_class == "internal_store":
             tag = "exposed" if run.exposed else "clean"
-            return system.execute(m.tool_id, params, None, self.workload, tag=tag)
-        items = system.read(m.tool_id, params)
+            return system.execute(m.tool_id, params, cred, self.workload, tag=tag)
+        items = system.read(m.tool_id, params, cred, self.workload)
         return self._apply_read_result(run, node, m, items)
 
     def _sanitize(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any]) -> dict[str, Any]:
@@ -439,12 +493,24 @@ class EnforcementPoint:
                 bucket.add(digest(v))
         return accepted
 
+    def _no_factor(self, run: Run, factors: set[str], chain: dict[str, Any] | None = None) -> bool:
+        """6.1: an effect with no factor on a run that is neither exposed nor delegated."""
+        acting = (chain or run.principal_chain).get("acting_user")
+        return not factors and not run.exposed and acting is None
+
     def _effect(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any], approval_ref: dict[str, Any] | None = None,
-                grant: str | None = None) -> Any:
+                grant: str | None = None, chain: dict[str, Any] | None = None) -> Any:
         if node.type != "effect":
             raise Denied("effects are made only by effect nodes")
         if self._stopped(run, m.tool_id):
             self._stop_refusal(run, node, m, params, "normal")
+        # degradation gate (6.1): under an EVS or RUN outage only a no-factor, scope-anchored effect continues
+        factors = self.registry.derive_factors(m, params)
+        if not self.evs.available and not self._no_factor(run, factors, chain):
+            raise Unavailable("EVS")
+        if not self.run.available:
+            if self.form == "proxy" or not self._no_factor(run, factors, chain) or not scope_only(node.bounds):
+                raise Unavailable("RUN")
         keys = self._keys(run, m, params)
         counters: dict[str, int] = {}
         reservation: str | None = None
@@ -460,11 +526,16 @@ class EnforcementPoint:
             counters = {k: self.local_counters["effects"] for k in keys}
             if self.journal:
                 self.journal.local_counters["effects"] = self.local_counters["effects"]
-        rq = self._request(run, node, m, params, "normal", counters, approval_ref=approval_ref)
-        if counted_locally and self.bundle and self.local_counters["effects"] > self.bundle.values.degraded_caps.get("effects_per_pep", 10):
-            d = Decision("DENY", "degraded_cap", "degraded-mode cap reached")
-        else:
-            d = self._decide(rq, run, counted_locally)
+        rq = self._request(run, node, m, params, "normal", counters, approval_ref=approval_ref, chain=chain)
+        try:
+            if counted_locally and self.bundle and self.local_counters["effects"] > self.bundle.values.degraded_caps.get("effects_per_pep", 10):
+                d = Decision("DENY", "degraded_cap", "degraded-mode cap reached")
+            else:
+                d = self._decide(rq, run, counted_locally)
+        except Exception:
+            if reservation:
+                self.run.release(reservation)
+            raise
         if d.result == "DENY":
             self._decision_event(run, node, rq, d, reservation, counters, None, approval_ref and approval_ref["payload"]["approval_ref"])
             if reservation:
@@ -621,14 +692,24 @@ class EnforcementPoint:
         content = params
         sanitized = False
         if "require_sanitizer" in d.obligations:
-            s = next(x for x in self.registry.sanitizers.values() if x.rendering)
+            s = next((x for x in self.registry.sanitizers.values() if x.rendering), None)
+            if s is None:
+                self._write(run, {"type": "delivery.failed", "node_id": node.id, "sink": sink, "sanitizer_applied": False, "error": "no rendering sanitizer registered"})
+                self._denied(run, node)
+                raise Denied("no rendering sanitizer registered")
             acc, rej = s.fn({"content": params.get("content", "")})
             content = {**params, "content": acc["content"]}
             sanitized = True
             self._write(run, {"type": "sanitize.result", "node_id": node.id, "sanitizer": s.sanitizer_id, "version": s.version,
                               "accepted_ref": self._payload(acc), "rejected_ref": self._payload(rej)})
         tag = "exposed" if run.exposed else "clean"
-        res = self.systems[m.target_system].execute(m.tool_id, content, None, self.workload, "delivery", tag=tag if "apply_provenance_tag" in d.obligations else None)
+        try:
+            cred = self._credential(run, node, m, "normal", rq.action_hash)
+        except Refused as e:
+            self._write(run, {"type": "delivery.failed", "node_id": node.id, "sink": sink, "sanitizer_applied": sanitized, "error": f"credential refused: {e}"})
+            self._denied(run, node)
+            raise Denied(f"credential refused: {e}")
+        res = self.systems[m.target_system].execute(m.tool_id, content, cred, self.workload, "normal", tag=tag if "apply_provenance_tag" in d.obligations else None)
         self._write(run, {"type": "delivery.executed", "node_id": node.id, "sink": sink, "sanitizer_applied": sanitized, "result_ref": self._payload(res)})
         return res
 
@@ -654,6 +735,12 @@ class EnforcementPoint:
     def model_call(self, run: Run, node: Node, model: str, prompt: str, tokens: int = 100) -> str:
         if self.mgw is None:
             raise Denied("no model gateway")
+        if node.type not in {"read", "loop", "effect", "output"}:
+            raise Denied(f"a {node.type} node makes no model call (4.2)")
+        if run.state != "RUNNING":
+            raise Denied(f"run is {run.state}; a held or parked run makes no model calls")
+        if node.id not in run.entered and node.id not in self.local_entered.get(run.run_id, []):
+            raise Denied("node_entered not confirmed")
         if (run.run_id, node.id) in self.capped_nodes:
             raise Denied("cap_reached: the PEP refuses the node's next model credential")
         release = {"agent_id": run.release.agent_id, "version": run.release.version, "surface": run.release.surface, "pep_form": run.release.pep_form}
@@ -706,7 +793,8 @@ class EnforcementPoint:
         self._decision_event(run, node, rq, d, None, {}, None, None)
         if d.result != "ALLOW":
             raise Denied(d.reason or "preview denied")
-        res = self.systems[m.target_system].preview(params)
+        cred = self._credential(run, node, pt, "normal", rq.action_hash)
+        res = self.systems[m.target_system].preview(params, cred, self.workload)
         self._apply_read_result(run, node, pt, [res])
         return {"result_ref": self._payload(res), "result": res}
 
@@ -720,8 +808,12 @@ class EnforcementPoint:
             self.pending[(run.run_id, node.id)] = p
         if run.state != "RUNNING":
             raise Denied("resume on a run that is not RUNNING")
+        chain = None
+        if approval_ref["payload"].get("kind") == "substitution":
+            approver = approval_ref["payload"]["approver_assertion"]["payload"]["approver"]
+            chain = {"acting_user": approver, "agents": list(run.agents), "requested_principal": run.acting_user}
         try:
-            result = self._effect(run, node, p.tool, p.parameters, approval_ref=approval_ref, grant=grant)
+            result = self._effect(run, node, p.tool, p.parameters, approval_ref=approval_ref, grant=grant, chain=chain)
         except Held:
             return {"status": "held_again"}
         except Denied as e:
@@ -809,8 +901,13 @@ class EnforcementPoint:
         presentation = self.registry.systems[m.target_system].presentation
         try:
             cred = self._credential(run, node, m, "replay", original["action_hash"])
+        except (Refused, Unavailable) as e:
+            return {"status": "not_attempted", "reason": str(e)}     # nothing was sent: the node stays in doubt
+        try:
             res = self.systems[m.target_system].execute(m.tool_id, params, cred, self.workload, "replay", original["action_hash"], original["idempotency_key"])
-        except (SystemRefused, Refused, Unavailable) as e:
+        except SystemRefused as e:
+            # the replay was refused; that says nothing definitive about the original (a v1.1 item), so the
+            # event carries purpose = replay and RUN keeps the node in doubt for a resolver
             self._write(run, {"type": "effect.failed", "node_id": node.id, "purpose": "replay", "credential_presentation": presentation,
                               "error": "system_error", "recorded_by": "pep", "action_hash": original["action_hash"]})
             return {"status": "failed", "reason": str(e)}

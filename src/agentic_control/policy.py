@@ -160,7 +160,11 @@ class PolicyDecisionPoint(Availability):
         node, m = rq.node, rq.tool
         holds: list[str] = []
         obligations = ["evidence_first"]
-        discharged = set((rq.approval_ref or {}).get("payload", {}).get("causes_discharged", [])) if rq.approval_ref else set()
+        discharged: set[str] = set()
+        if rq.approval_ref is not None:
+            if not self.trust.verify(rq.approval_ref, role="run") or rq.approval_ref["payload"].get("action_hash") != rq.action_hash:
+                return Decision("DENY", "approval_record", "approval record does not verify for this action hash")
+            discharged = set(rq.approval_ref["payload"].get("causes_discharged", []))
 
         def hold(cause: str) -> None:
             if cause not in discharged and cause not in holds:

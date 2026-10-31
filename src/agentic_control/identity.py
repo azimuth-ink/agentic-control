@@ -184,13 +184,20 @@ class IdentityService(Availability):
     def _check_timers(self, assertion: dict[str, Any]) -> str | None:
         """Expiry without a clock: IDS computes it from RUN-signed timer state and its own clock."""
         now = self.clock.now()
-        suspended = sum(min(e, now) - s for s, e in assertion.get("suspensions", []))
-        suspended = min(suspended, self.policy.max_park)
+
+        def suspended(since: float) -> float:
+            total = 0.0
+            for s, e in assertion.get("suspensions", []):
+                s, e = max(s, since), min(e, now)
+                if e > s:
+                    total += e - s
+            return min(total, self.policy.max_park)
+
         if assertion.get("approval_time") is None:
-            if now - assertion["hold_time"] - suspended > self.policy.approval_timeout:
+            if now - assertion["hold_time"] - suspended(assertion["hold_time"]) > self.policy.approval_timeout:
                 return "timeout"
             return None
-        if now - assertion["approval_time"] - suspended > self.policy.resume_window:
+        if now - assertion["approval_time"] - suspended(assertion["approval_time"]) > self.policy.resume_window:
             return "expired"
         return None
 

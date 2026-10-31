@@ -75,8 +75,7 @@ class Runtime:
         self.pep.enter_node(run, node, {"node": node.id})
         self.trace.append((node.id, "entered"))
         if node.type == "human":
-            self.run.input_hold(run, node)
-            raise Held(node.id)
+            raise Held(node.id)          # RUN opened the input hold on the node_entered hook
         if node.type == "loop":
             result = self._loop(run, node, ctx)
         elif node.type == "sanitize":
