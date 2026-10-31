@@ -40,7 +40,7 @@ Everything runs in one process with injected time. There is no network, no datab
 
 ```
 pip install -e ".[dev]"
-pytest                                    # 146 tests
+pytest                                    # 155 tests
 python tools/conformance_report.py        # which clauses and findings are covered
 ```
 

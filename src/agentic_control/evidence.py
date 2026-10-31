@@ -112,6 +112,14 @@ class EvidenceStore(Availability):
                          "events_count": len(entries), "counters_merged": journal.counters_merged()})
         return len(entries)
 
+    def import_external(self, source: str, record: dict[str, Any], expected_fields: list[str]) -> str:
+        """Logs from an ungoverned surface (S3, S5) are imported as `external.imported`, naming which of the
+        expected fields the record carried and which it lacked (section 7)."""
+        present = [f for f in expected_fields if f in record]
+        missing = [f for f in expected_fields if f not in record]
+        return self.append({"type": "external.imported", "scope": f"external:{source}", "source": source,
+                            "fields_present": present, "fields_missing": missing, "raw_ref": self.payloads.put(record)})
+
     def erase(self, run_id: str, refs: list[str], authority: str) -> None:
         for r in refs:
             self.payloads.erase(r)

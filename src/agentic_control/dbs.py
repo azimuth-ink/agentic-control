@@ -34,6 +34,12 @@ class System(Availability):
         self.seen_keys: dict[str, dict[str, Any]] = {}
         self.fail_next: str | None = None        # 'refuse' | 'indeterminate' | 'indeterminate_but_executed'
         self.accepted_classes: set[str] = {"governed_agent", "recovery"}
+        # what the tool server advertises live: tool -> {"schema": ..., "description": ...}; the PEP hashes
+        # it and compares with the manifest's schema_hash (A.1)
+        self.advertised: dict[str, dict[str, Any]] = {}
+
+    def advertise(self, tool: str, schema: dict[str, str], description: str = "") -> None:
+        self.advertised[tool] = {"schema": schema, "description": description}
 
     # --- credential acceptance: what a system checks
     def _accept(self, credential: dict[str, Any] | None, presenter: str, purpose: str, action_hash: str | None) -> None:

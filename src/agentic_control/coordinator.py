@@ -256,6 +256,10 @@ class RunCoordinator(Availability):
             run.effect_node_entered = True
         run.last_heartbeat = self.clock.now()
         self._ev(run, {"type": "node.hook", "node_id": node_id, "node_type": node_type, "inputs_ref": inputs_ref})
+        if run.release.pep_form == "proxy":
+            # S1: RUN writes node.entered from the platform's hook, which carries the inputs reference (A.4)
+            self._ev(run, {"type": "node.entered", "node_id": node_id, "node_type": node_type, "inputs_ref": inputs_ref,
+                           "provenance_claimed": False, "written_by": "run"})
         if node_type == "human":
             self.input_hold(run, run.release.node(node_id))   # node entry has one source; RUN opens the input hold
         return True
@@ -282,6 +286,9 @@ class RunCoordinator(Availability):
         run.exited.add(node_id)
         run.in_doubt_cache.discard(node_id)
         self.update_run_state(run, run_state)
+        if run.release.pep_form == "proxy":
+            self._ev(run, {"type": "node.exited", "node_id": node_id, "outputs_ref": self.evs.payloads.put(outputs) if self.evs.available else "journaled",
+                           "data_classes_touched": sorted(run.data_classes_touched), "exposed": run.exposed, "written_by": "run"})
         run.next_node = branch if branch else run.release.next_after(node_id)
         run.last_heartbeat = self.clock.now()
         if run.next_node is None and run.state == "RUNNING":
