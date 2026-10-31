@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .common import Availability, Record, Refused, digest
+from .common import Clock, Availability, Record, Refused, digest
 from .crypto import PublicKey
 from .release import (DERIVED_CLASSES, MATRIX, NODE_TYPES, SIDE_EFFECT_CLASSES, Node, Release, anchored_params)
 
@@ -169,10 +169,12 @@ class Agent(Record):
 class Registry(Availability):
     name = "REG"
 
-    def __init__(self, boundary: Boundary) -> None:
+    def __init__(self, boundary: Boundary, clock: Clock | None = None) -> None:
         self.boundary = boundary
+        self.clock = clock
         self.systems: dict[str, SystemCapability] = {}
         self.tools: dict[str, ToolManifest] = {}
+        self.unregistered: dict[str, str] = {}
         self.triggers: dict[str, Trigger] = {}
         self.sanitizers: dict[str, Sanitizer] = {}
         self.agents: dict[str, Agent] = {}
@@ -217,6 +219,7 @@ class Registry(Availability):
 
     def register_tool(self, m: ToolManifest) -> ToolManifest:
         self._check()
+        self.unregistered.pop(m.tool_id, None)
         target = self.systems.get(m.target_system)
         if target is None and not m.is_sanitizer:
             raise Refused(f"unknown target system {m.target_system}")
@@ -613,7 +616,64 @@ class Registry(Availability):
 
     def get_tool_manifest(self, tool_id: str) -> ToolManifest:
         self._check()
+        if tool_id in self.unregistered:
+            raise Refused(f"tool {tool_id} is unregistered: {self.unregistered[tool_id]}")
         return self.tools[tool_id]
+
+    def unregister_tool(self, tool_id: str, reason: str) -> None:
+        """A live schema-hash mismatch unregisters the tool until it is re-registered (A.1, I5)."""
+        m = self.tools.pop(tool_id, None)
+        if m is None:
+            return
+        self.unregistered[tool_id] = reason
+        self.notifications.append(f"maintainer of {tool_id} ({m.maintainer}): tool unregistered: {reason}")
+        for rel in self.releases.values():
+            if any(tool_id in n.declared_tools() for n in rel.nodes):
+                self.notifications.append(f"owner of {rel.release_id}: release depends on unregistered tool {tool_id}")
+
+    def access_review(self, entitlements: dict[str, dict[str, list[str]]]) -> list[str]:
+        """The access-review cycle (A.1): an identity's grants against the registry's permitted tools and
+        data classes, plus trigger registrations, manifests, sources[] entries, and feed reviews."""
+        self._check()
+        findings: list[str] = []
+        now = self.clock.now() if self.clock else None
+        for agent_id, ent in entitlements.items():
+            agent = self.agents.get(agent_id)
+            if agent is None:
+                findings.append(f"{agent_id}: entitlements for an agent not in the registry")
+                continue
+            if agent.expiry is not None and now is not None and agent.expiry < now:
+                findings.append(f"{agent_id}: registry entry lapsed")
+            for t in ent.get("tools", []):
+                if t not in self.tools:
+                    findings.append(f"{agent_id}: entitled to unregistered tool {t}")
+                elif self.tools[t].target_system.startswith("__"):
+                    continue                      # agent tools and sanitizers have no system of their own
+                elif self.tools[t].target_system not in ent.get("systems", []):
+                    findings.append(f"{agent_id}: entitled to tool {t} without its system {self.tools[t].target_system}")
+            for sys_id in ent.get("systems", []):
+                if sys_id not in self.systems:
+                    findings.append(f"{agent_id}: entitled to unregistered system {sys_id}")
+                elif not any(t.target_system == sys_id and t.tool_id in ent.get("tools", []) for t in self.tools.values()):
+                    findings.append(f"{agent_id}: entitled to system {sys_id} with no entitled tool on it (unused grant)")
+            for a in ent.get("agents", []):
+                if a.removeprefix("agent:") not in self.agents:
+                    findings.append(f"{agent_id}: may invoke unregistered agent {a}")
+        for trig in self.triggers.values():
+            if trig.signing_key is None:
+                findings.append(f"trigger {trig.trigger_id}: no signing key registered")
+            if trig.source_system not in self.systems:
+                findings.append(f"trigger {trig.trigger_id}: source system {trig.source_system} not registered")
+        for cap in self.systems.values():
+            for src in cap.sources:
+                if src not in self.systems:
+                    findings.append(f"{cap.system_id}: source {src} not registered")
+                elif cap.provenance_tag and not cap.feed_reviews.get(src, False):
+                    findings.append(f"{cap.system_id}: feed from {src} has no passed review")
+        for m in self.tools.values():
+            if m.target_system not in self.systems and not m.target_system.startswith("__"):
+                findings.append(f"tool {m.tool_id}: target system {m.target_system} not registered")
+        return findings
 
     def on_bundle_published(self, policy: "PolicyValues") -> None:
         """When a new policy bundle is published, every release is re-linted; a release whose held

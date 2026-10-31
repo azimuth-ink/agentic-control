@@ -13,7 +13,7 @@ Reference implementation of the Agentic Control Architecture v1.0 (internal spec
 - RUN: hooks and checkpoints, counters (reserve/release/confirm/reconcile), holds with grants and substitution, parks and recovery with timer suspension, effects in doubt with bounded replay and resolver outcomes, stops, escalation and the OPS close on the owner's deadline, child runs.
 - The PEP's per-call duties and degraded modes (ADR 0004); deliveries with the rendering sanitizer; spawns; RUN-instructed previews, resumes, compensations and replays.
 - The section-8 warranty flow as a runnable example with adversarial model behaviours and graph variants.
-- Conformance suite F1–F9 plus review regressions (126 tests) with `@spec` markers; unit tests (20); `tools/conformance_report.py --check` in CI.
+- Conformance suite F1–F9 plus review regressions (134 tests) with `@spec` markers; unit tests (20); `tools/conformance_report.py --check` in CI.
 
 ### Found by the conformance suite and fixed before this version
 - A replacement PEP recomputed parameter provenance from a process-local set and so held an already-sanitized parameter for exposure; provenance is now rebuilt from the run's `sanitize.result` evidence.
@@ -30,6 +30,13 @@ Reference implementation of the Agentic Control Architecture v1.0 (internal spec
 - A credential unavailable before the call left the node in doubt on recovery; the PEP now records `effect.failed` with `error = not_executed`.
 - `derive_factors` added `irreversible` to read-only tools from the manifest's default compensation value.
 - An undeclared tool was refused structurally without a decision event; node declaration is now recorded as the first rule.
+
+### Added after the first review
+- REG row of 6.1: the PEP caches manifests with a time to live and continues on them during a REG outage; registrations and releases are refused.
+- Live schema-hash check (A.1, I5): a tool server's advertised schema or description that differs from the manifest unregisters the tool, denies the call, and fails the dependent release's lint until re-registration.
+- S1 proxy form: RUN writes `node.entered` and `node.exited` from the platform hooks; PEP-P writes call-level events only.
+- `external.imported` for logs from ungoverned surfaces (section 7); the access review of A.1 (`Registry.access_review`).
+- MGW outage and declared-route tests; the agent token budget test.
 
 ### Found by the first independent code review and fixed before this version
 - Factored, exposed, or delegated effects executed during an EVS or RUN outage; the 6.1 gate (no factor, neither exposed nor delegated, scope-anchored under RUN) is now applied in the PEP before any reservation, and reads of `restricted` data stop under every outage.
@@ -49,5 +56,5 @@ Reference implementation of the Agentic Control Architecture v1.0 (internal spec
 ### Known gaps (deferred with the specification's v1.1 list, section 11)
 - `approval_records[]` in the IDS contract and the two-approver substitution rule.
 - The rendering sanitizer as a PEP-applied obligation rather than a tool.
-- Per-agent token budget enforcement (`spend_to_date` is recorded, not capped).
+- The per-agent token budget is applied at MGW without a period rotation (the specification says "per period"; the period is policy content).
 - Park and escalation deadlines as policy values (constants on RUN here).

@@ -22,6 +22,7 @@ from .registry import Registry, ToolManifest
 from .release import Node, scope_only
 
 COUNTER_WINDOW = 3600.0
+MANIFEST_TTL = 3600.0        # how long a cached manifest serves during a REG outage (deployment content)
 
 
 _TYPES = {"string": (str,), "number": (int, float), "boolean": (bool,), "object": (dict,), "array": (list,)}
@@ -88,7 +89,8 @@ class EnforcementPoint:
         self.signed_bundle: dict[str, Any] | None = None
         self.stop_list: StopList | None = None
         self.stop_list_signed: dict[str, Any] | None = None
-        self.pending: dict[tuple[str, str], PendingEffect] = {}       # (run_id, node_id) -> pending held effect
+        self.pending: dict[tuple[str, str], PendingEffect] = {}
+        self.manifest_cache: dict[str, tuple[ToolManifest, float]] = {}       # (run_id, node_id) -> pending held effect
         self.sanitized: dict[str, set[str]] = {}                       # run_id -> accepted value hashes
         self.credential_cache: dict[tuple[str, str, str], dict[str, Any]] = {}  # (run, node, audience)
         self.capped_nodes: set[tuple[str, str]] = set()
@@ -186,13 +188,15 @@ class EnforcementPoint:
             if node.type == "effect":
                 run.effect_node_entered = True
             self._write(run, {"type": "node.hook", "node_id": node.id, "node_type": node.type, "inputs_ref": inputs_ref})
-        self._write(run, {"type": "node.entered", "node_id": node.id, "node_type": node.type, "inputs_ref": inputs_ref,
-                          "provenance_claimed": False})
+        if self.form != "proxy":
+            self._write(run, {"type": "node.entered", "node_id": node.id, "node_type": node.type, "inputs_ref": inputs_ref,
+                              "provenance_claimed": False, "written_by": "pep"})
         self.step_counts[(run.run_id, node.id)] = 0
 
     def exit_node(self, run: Run, node: Node, outputs: Any, branch: str | None = None) -> None:
-        self._write(run, {"type": "node.exited", "node_id": node.id, "outputs_ref": self._payload(outputs),
-                          "data_classes_touched": sorted(run.data_classes_touched), "exposed": run.exposed})
+        if self.form != "proxy":
+            self._write(run, {"type": "node.exited", "node_id": node.id, "outputs_ref": self._payload(outputs),
+                              "data_classes_touched": sorted(run.data_classes_touched), "exposed": run.exposed, "written_by": "pep"})
         try:
             self.run.checkpoint(run, node.id, outputs, {"step_count": {node.id: self.step_counts.get((run.run_id, node.id), 0)}}, branch)
         except Unavailable:
@@ -412,7 +416,8 @@ class EnforcementPoint:
         if node.id in run.in_doubt_cache:
             raise Denied("node in doubt")
         self.heartbeat(run)
-        m = self.registry.get_tool_manifest(tool_id)
+        m = self._manifest(tool_id)
+        self._check_live_schema(run, node, m)
         if tool_id not in node.declared_tools():
             # node declaration is the first rule and is recorded like any decision (A.3)
             rq = self._request(run, node, m, params, "normal", {})
@@ -440,6 +445,42 @@ class EnforcementPoint:
         if m.side_effect_class in {"none", "internal_store"}:
             return self._read(run, node, m, params)
         return self._effect(run, node, m, params)
+
+    def _manifest(self, tool_id: str) -> ToolManifest:
+        """Manifests come from REG and are cached with a time to live; during a REG outage the PEP
+        continues on the cache until it expires (6.1, REG row)."""
+        try:
+            m = self.registry.get_tool_manifest(tool_id)
+            self.manifest_cache[tool_id] = (m, self.clock.now())
+            return m
+        except Unavailable:
+            cached = self.manifest_cache.get(tool_id)
+            if cached and self.clock.now() - cached[1] <= MANIFEST_TTL:
+                return cached[0]
+            raise
+        except KeyError:
+            raise Denied(f"unknown tool {tool_id}")
+
+    def _check_live_schema(self, run: Run, node: Node, m: ToolManifest) -> None:
+        """The PEP hashes the live schema and description the tool server supplies and compares with the
+        manifest; on mismatch the tool is unregistered until re-registered (A.1, I5)."""
+        system = self.systems.get(m.target_system)
+        live = system.advertised.get(m.tool_id) if system is not None else None
+        if live is None:
+            return
+        if digest({"schema": live["schema"], "description": live.get("description", "")}) != m.schema_hash:
+            reason = "live schema or description differs from the registered manifest"
+            try:
+                self.registry.unregister_tool(m.tool_id, reason)
+            except Unavailable:
+                pass
+            self.manifest_cache.pop(m.tool_id, None)
+            self._write(run, {"type": "decision", "node_id": node.id, "purpose": "normal", "tool": m.tool_id, "version": m.version,
+                              "schema_hash": m.schema_hash, "parameters_ref": "none", "parameter_roles": m.parameter_roles,
+                              "action_hash": "", "factors": [], "decision": "DENY", "rule_id": "schema_hash", "reason": reason,
+                              "obligations": [], "stop_list_seq": self.stop_list.sequence if self.stop_list else 0})
+            self._denied(run, node)
+            raise Denied(f"{m.tool_id}: {reason}")
 
     def _down(self) -> str | None:
         """The first control-plane component the PEP can see is unavailable, else None."""
