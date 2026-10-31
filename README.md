@@ -32,6 +32,7 @@ examples/warranty/  the section-8 worked flow with adversarial model behaviours 
 tests/conformance/  F1–F9, each test marked with the specification clauses it covers
 tests/unit/         primitives
 tools/conformance_report.py   the clause → test matrix; `--check` fails CI if a finding has no test
+tools/trace.py                renders a run's evidence trail; the source of docs/worked-flow.md
 ```
 
 Everything runs in one process with injected time. There is no network, no database, and no real model: the point is to make the control semantics executable and testable, not to ship a product.
@@ -42,6 +43,7 @@ Everything runs in one process with injected time. There is no network, no datab
 pip install -e ".[dev]"
 pytest                                    # 155 tests
 python tools/conformance_report.py        # which clauses and findings are covered
+python tools/trace.py --hold              # a run's evidence trail as a timeline (see docs/worked-flow.md)
 ```
 
 The worked flow, by hand:
