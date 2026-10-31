@@ -6,10 +6,9 @@ delivery tools (to an interface or a sink store), and the outbound data-loss che
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .common import Availability, Refused, digest
+from .common import Availability, digest
 
 
 class SystemRefused(Exception):

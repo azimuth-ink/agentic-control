@@ -5,7 +5,7 @@ loop, effect and output nodes and never decides whether an effect happens; every
 the PEP. Holds stop the walk; the walk continues at the checkpointed next node after RUN resumes."""
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .common import Denied, Unavailable
 from .coordinator import Run, RunCoordinator
@@ -43,7 +43,7 @@ class Runtime:
                 continue
             except Denied as e:
                 self.trace.append((node.id, f"denied: {e}"))
-                if run.next_node == node.id:   # the PEP could not move the checkpoint (RUN down)
+                if run.state == "RUNNING" and run.next_node == node.id:   # the PEP could not move the checkpoint (RUN down)
                     run.next_node = node.denial_branch
                 if run.state == "RUNNING" and run.next_node is None:
                     try:

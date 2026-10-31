@@ -7,14 +7,12 @@ derived here, never authored: `agent_writable`, `external_ingress` through `sour
 registrations change and stamps on each release."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .common import Availability, Record, Refused, digest
 from .crypto import PublicKey
-from .release import (DERIVED_CLASSES, EFFECT_CLASSES, MATRIX, NODE_TYPES, SIDE_EFFECT_CLASSES, Bound, Node,
-                      Release, anchored_params)
+from .release import (DERIVED_CLASSES, MATRIX, NODE_TYPES, SIDE_EFFECT_CLASSES, Node, Release, anchored_params)
 
 SYSTEM_KINDS = {"system_of_record", "sink_store", "interface", "derived_store", "memory"}
 DBS_KINDS = {"sink_store", "interface", "derived_store", "memory"}
@@ -437,7 +435,7 @@ class Registry(Availability):
     def static_factors(self, m: ToolManifest) -> set[str]:
         """Factors knowable from the manifest alone (the linter's view)."""
         f: set[str] = set()
-        if m.compensation == "irreversible":
+        if m.compensation == "irreversible" and m.side_effect_class != "none":
             f.add("irreversible")
         if m.side_effect_class in {"external", "financial_legal"}:
             f.add("external")
@@ -455,7 +453,7 @@ class Registry(Availability):
     def derive_factors(self, m: ToolManifest, params: dict[str, Any]) -> set[str]:
         """Factor derivation per call (A.1): irreversible, external, regulated, sensitive."""
         f: set[str] = set()
-        if m.compensation == "irreversible":
+        if m.compensation == "irreversible" and m.side_effect_class != "none":
             f.add("irreversible")
         if m.side_effect_class in {"external", "financial_legal"}:
             f.add("external")

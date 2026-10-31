@@ -135,7 +135,7 @@ class WarrantyModel:
         if node.id == "n6":
             return {"sink": "case-log", "content": "Replacement issued. See https://evil.example/x?token=abc for details."}
         if node.id == "n0":
-            return {"topic": "warranty" if self.behaviour != "bad_topic" else "finance", "text": "ticket received"}
+            return {"topic": "warranty" if self.behaviour != "bad_topic" else "finance", "text": "ticket received", "priority": 1}
         if node.id == "h1":
             return {"inputs": {"ticket": "t-1"}}
         raise KeyError(node.id)
@@ -208,9 +208,10 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     `with_child` replaces the middle of the graph with a handoff to a triage agent; `trigger` selects the
     trigger the run starts from (fault-ticket, clean-ticket, console)."""
     clock = clock or Clock()
-    policy = policy or policy_values()
-    if regulated_irreversible:
-        policy.two_approver_threshold = 150.0
+    if policy is None:
+        policy = policy_values()
+        if regulated_irreversible:
+            policy.two_approver_threshold = 150.0
     boundary = Boundary(inside_systems={"support_portal", "device_registry", "fulfilment", "mail_relay", "identity_system", "case_log", "agent_memory", "notes", "console"},
                         resolvers={"postal_address": lambda v: False, "email": lambda v: str(v).endswith("@corp.internal")},
                         can_resolve_outside={"postal_address": True, "email": True})
@@ -260,7 +261,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
                                    parameter_roles={"device_id": "resource", "destination": "destination", "amount": "amount"},
                                    destination_class="postal_address", compliance_flag=regulated_irreversible,
                                    compensation="irreversible" if regulated_irreversible else {"reversing_tool": "cancel_shipment", "params": {"shipment_id": "result.shipment_id"}}))
-    reg.register_tool(ToolManifest("add_note", "1", "notes", {"topic": "string", "text": "string"}, side_effect_class="reversible_internal",
+    reg.register_tool(ToolManifest("add_note", "1", "notes", {"topic": "string", "text": "string", "priority": "number"}, side_effect_class="reversible_internal",
                                    writes_fields=[("notes", "text")], parameter_roles={"topic": "resource"},
                                    compensation={"reversing_tool": "delete_note", "params": {"note_id": "result.note_id"}}))
     reg.register_tool(ToolManifest("delete_note", "1", "notes", {"note_id": "string"}, side_effect_class="reversible_internal",
@@ -325,7 +326,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     release = Release(AGENT, "1.0", surface, form, "pep-1.0", nodes,
                       tools={n.tool: "1" for n in nodes if n.tool}, scopes={"templates": ["tpl-shipped", "tpl-denied"], "sinks": ["case-log"], "recipients": [], "topics": ["warranty"]},
                       model_route=["model-a"])
-    entitlements = {AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": [f"agent:triage-agent"]}}
+    entitlements = {AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": ["agent:triage-agent"]}}
     if with_child:
         entitlements["triage-agent"] = {"tools": ["read_ticket"], "systems": ["support_portal"], "agents": []}
     bundle = PolicyBundle("1", policy, entitlements=entitlements, recipient_clearance={"cust-1": "confidential"})

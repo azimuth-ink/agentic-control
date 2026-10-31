@@ -8,10 +8,10 @@ updates run state at RUN before releasing a result. It holds the signed bundle a
 a signed local journal for degraded mode."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .common import Clock, Denied, Refused, Unavailable, digest, new_id
+from .common import Clock, Denied, Refused, Unavailable, digest
 from .coordinator import EffectRecord, Run, RunCoordinator
 from .crypto import TrustStore
 from .dbs import DLP, Indeterminate, System, SystemRefused
@@ -113,6 +113,20 @@ class EnforcementPoint:
             return True
         return self.stop_list is not None and self.stop_list.in_scope(run.agent_id, tool_id, run.surface) is not None
 
+    def _stop_refusal(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any], purpose: str) -> None:
+        """Enforced from the PEP's own list (A.4): the decision is recorded as denied by stop scope and the
+        run leaves RUNNING through RUN (cancelled or parked at this node, 4.9)."""
+        stop = self.stop_list.in_scope(run.agent_id, m.tool_id, run.surface) if self.stop_list else None
+        rq = self._request(run, node, m, params, purpose, {})
+        d = Decision("DENY", "stop_scope", f"stop {stop.stop_id} in scope" if stop else "stop list stale")
+        self._decision_event(run, node, rq, d, None, {}, None, None)
+        try:
+            self.run.stop_refusal(run, node.id, stop.stop_id if stop else None)
+        except Unavailable:
+            run.state = "PARKED"
+            run.park = {"reason": "stop at " + node.id, "resolver": "oncall-resolver", "deadline": None, "recoverable": False, "from": "RUNNING"}
+        raise Denied(d.reason or "stopped")
+
     # ------------------------------------------------------------------ evidence
     def _write(self, run: Run, event: dict[str, Any]) -> str:
         """Writes to EVS and waits for the durable acknowledgement; in degraded mode, to the journal."""
@@ -182,9 +196,30 @@ class EnforcementPoint:
             return "p:" + digest(obj)
 
     # ------------------------------------------------------------------ per-call duties
+    def _accepted(self, run: Run) -> set[str]:
+        """Values a qualifying sanitizer accepted in this run. A replacement PEP has no local record and
+        rebuilds the set from the run's sanitize.result events (the accepted payload is evidence, 5.3)."""
+        acc = self.sanitized.get(run.run_id)
+        if acc is None:
+            acc = set()
+            for e in self._evidence(run):
+                if e.get("type") != "sanitize.result":
+                    continue
+                s = self.registry.sanitizers.get(e.get("sanitizer", ""))
+                if s is None or not s.qualifies_for_sanitized_provenance:
+                    continue
+                try:
+                    payload = self.evs.payloads.get(e["accepted_ref"])
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    acc |= {digest(v) for v in payload.values()}
+            self.sanitized[run.run_id] = acc
+        return acc
+
     def _provenance(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any]) -> dict[str, str]:
         out: dict[str, str] = {}
-        accepted = self.sanitized.get(run.run_id, set())
+        accepted = self._accepted(run)
         for p, v in params.items():
             if node.template_param == p and v in (run.release.scopes.get("templates") or []):
                 out[p] = "template"
@@ -219,14 +254,16 @@ class EnforcementPoint:
             rehold_count=run.rehold_counts.get(self._action_hash(m, params, run, node.id), 0),
             destination_outside=self.registry.destination_outside(m, params), preview_instructed=preview_instructed)
 
-    def _decide(self, rq: DecisionRequest, run: Run) -> Decision:
+    def _decide(self, rq: DecisionRequest, run: Run, counted_locally: bool = False) -> Decision:
         """Submit to the PDP; on a PDP outage, local evaluation of the cached bundle for what 6.1 allows."""
         try:
             return self.pdp.decide(rq)
-        except Unavailable:
-            return self._local_decide(rq, run)
+        except Unavailable as e:
+            if e.component == "PIP":
+                raise          # a PIP-anchored bound cannot be evaluated anywhere: the run parks (6.1)
+            return self._local_decide(rq, run, counted_locally)
 
-    def _local_decide(self, rq: DecisionRequest, run: Run) -> Decision:
+    def _local_decide(self, rq: DecisionRequest, run: Run, counted_locally: bool = False) -> Decision:
         """Degraded mode against the PDP (6.1): scope-anchored no-factor effects on runs neither exposed
         nor delegated continue on the cached bundle until the stop list is stale; compensation and replay
         continue; everything else stops."""
@@ -250,16 +287,21 @@ class EnforcementPoint:
         for b in rq.node.bounds:
             if b.form == "in_scope" and rq.parameters.get(b.param) not in (run.release.scopes.get(b.scope) or []):
                 return Decision("DENY", "bounds", f"{b.param} not in scope")
-            if b.form == "limit" and b.hard is not None and rq.parameters.get(b.param, 0) > b.hard:
-                return Decision("DENY", "hard_limit", "above hard limit")
-            if b.form == "limit" and b.auto is not None and rq.parameters.get(b.param, 0) > b.auto:
-                raise Unavailable("PDP")   # a hold cannot be processed locally
+            if b.form == "limit":
+                v = rq.parameters.get(b.param, 0)
+                if not isinstance(v, (int, float)):
+                    raise Unavailable("PDP")
+                if b.hard is not None and v > b.hard:
+                    return Decision("DENY", "hard_limit", "above hard limit")
+                if b.auto is not None and v > b.auto:
+                    raise Unavailable("PDP")   # a hold cannot be processed locally
         cap = self.bundle.values.degraded_caps.get("effects_per_pep", 10)
-        self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
+        if not counted_locally:
+            self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
+            if self.journal:
+                self.journal.local_counters["effects"] = self.local_counters["effects"]
         if self.local_counters["effects"] > cap:
             return Decision("DENY", "degraded_cap", "degraded-mode cap reached")
-        if self.journal:
-            self.journal.local_counters["effects"] = self.local_counters["effects"]
         return Decision("ALLOW", "local_bundle", None, [], [], False, ["evidence_first"])
 
     def _decision_event(self, run: Run, node: Node, rq: DecisionRequest, d: Decision, reservation: str | None,
@@ -267,10 +309,11 @@ class EnforcementPoint:
         ev = {"type": "decision", "node_id": node.id, "purpose": rq.purpose, "tool": rq.tool.tool_id, "version": rq.tool.version,
               "schema_hash": rq.tool.schema_hash, "parameters_ref": self._payload(rq.parameters), "parameters": rq.parameters,
               "parameter_roles": rq.tool.parameter_roles, "action_hash": rq.action_hash, "factors": sorted(rq.factors),
-              "tier": node.tier, "decision": d.result, "rule_id": d.rule_id, "obligations": d.obligations,
+              "tier": node.tier, "decision": d.result, "rule_id": d.rule_id, "reason": d.reason, "obligations": d.obligations,
               "stop_list_seq": rq.stop_list_seq, "provenance": rq.provenance}
         if reservation:
             ev["reservation_id"] = reservation; ev["counters_snapshot"] = counters
+            ev["reservation_keys"] = self._keys(run, rq.tool, rq.parameters)
         if idem:
             ev["idempotency_key"] = idem
         if approval_ref:
@@ -339,6 +382,13 @@ class EnforcementPoint:
             raise Denied("node in doubt")
         self.heartbeat(run)
         m = self.registry.get_tool_manifest(tool_id)
+        if tool_id not in node.declared_tools():
+            # node declaration is the first rule and is recorded like any decision (A.3)
+            rq = self._request(run, node, m, params, "normal", {})
+            d = Decision("DENY", "node_declaration", f"node {node.id} does not declare tool {tool_id}")
+            self._decision_event(run, node, rq, d, None, {}, None, None)
+            self._denied(run, node)
+            raise Denied(d.reason or "undeclared tool")
         # step cap for loop nodes
         c = self.step_counts.get((run.run_id, node.id), 0) + 1
         self.step_counts[(run.run_id, node.id)] = c
@@ -394,20 +444,27 @@ class EnforcementPoint:
         if node.type != "effect":
             raise Denied("effects are made only by effect nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("effect refused: stop in scope or stop list stale")
+            self._stop_refusal(run, node, m, params, "normal")
         keys = self._keys(run, m, params)
         counters: dict[str, int] = {}
         reservation: str | None = None
+        counted_locally = False
         try:
             reservation, counters = self.run.reserve(keys, COUNTER_WINDOW)
         except Unavailable:
             if self.form == "proxy":
                 raise
-            # RUN down: PEP-E local counters with tighter caps
+            # RUN down: PEP-E local counters with the degraded cap (6.1)
+            counted_locally = True
             self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
             counters = {k: self.local_counters["effects"] for k in keys}
+            if self.journal:
+                self.journal.local_counters["effects"] = self.local_counters["effects"]
         rq = self._request(run, node, m, params, "normal", counters, approval_ref=approval_ref)
-        d = self._decide(rq, run)
+        if counted_locally and self.bundle and self.local_counters["effects"] > self.bundle.values.degraded_caps.get("effects_per_pep", 10):
+            d = Decision("DENY", "degraded_cap", "degraded-mode cap reached")
+        else:
+            d = self._decide(rq, run, counted_locally)
         if d.result == "DENY":
             self._decision_event(run, node, rq, d, reservation, counters, None, approval_ref and approval_ref["payload"]["approval_ref"])
             if reservation:
@@ -455,6 +512,22 @@ class EnforcementPoint:
         except Refused as e:
             if "revoked" in str(e) or (approval_ref is not None):
                 return self._revoked_at_redemption(run, node, m, params, rq, reservation, presentation)
+            # any other IDS refusal (identity lapsed, workload unbound, form mismatch): no credential, no call
+            self._write(run, {"type": "effect.failed", "node_id": node.id, "purpose": "normal", "credential_presentation": presentation,
+                              "error": "revoked", "detail": str(e), "recorded_by": "pep", "action_hash": rq.action_hash})
+            if reservation:
+                self.run.release(reservation)
+            self.run.approved_action_used(run, node.id, "failed")
+            self._failed(run, node)
+            raise NodeFailed(f"credential refused: {e}")
+        except Unavailable as e:
+            # no credential was obtained, so nothing was sent: a definitive negative the PEP itself knows,
+            # recorded so the node is not in doubt when the run recovers (A.5)
+            self._write(run, {"type": "effect.failed", "node_id": node.id, "purpose": "normal", "credential_presentation": presentation,
+                              "error": "not_executed", "detail": f"no credential: {e.component} unavailable", "recorded_by": "pep",
+                              "action_hash": rq.action_hash})
+            if reservation:
+                self.run.release(reservation)
             raise
         if cred is None:
             return self._revoked_at_redemption(run, node, m, params, rq, reservation, presentation)
@@ -536,7 +609,7 @@ class EnforcementPoint:
         if node.type != "output":
             raise Denied("deliveries are made only by output nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("delivery refused under a stop")
+            self._stop_refusal(run, node, m, params, "delivery")
         rq = self._request(run, node, m, params, "delivery", {})
         d = self._decide(rq, run)
         self._decision_event(run, node, rq, d, None, {}, None, None)
@@ -563,7 +636,7 @@ class EnforcementPoint:
         if node.type not in {"handoff", "service"}:
             raise Denied("spawns are made only by handoff and service nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("spawn refused under a stop")
+            self._stop_refusal(run, node, m, params, "spawn")
         rq = self._request(run, node, m, params, "spawn", {})
         d = self._decide(rq, run)
         self._decision_event(run, node, rq, d, None, {}, None, None)
@@ -584,7 +657,11 @@ class EnforcementPoint:
         if (run.run_id, node.id) in self.capped_nodes:
             raise Denied("cap_reached: the PEP refuses the node's next model credential")
         release = {"agent_id": run.release.agent_id, "version": run.release.version, "surface": run.release.surface, "pep_form": run.release.pep_form}
-        cred = self.ids.issue_credential(self.workload, run.run_id, release, node.id, {}, run.principal_chain, "MGW", "model")
+        try:
+            cred = self.ids.issue_credential(self.workload, run.run_id, release, node.id, {}, run.principal_chain, "MGW", "model")
+        except Refused as e:
+            self.cap_reached(run, node.id)      # no model credential: the node makes no further model calls
+            raise Denied(f"model credential refused: {e}")
         text, cap = self.mgw.complete(cred, self.workload, run, node.id, model, prompt, tokens)
         if cap:
             self.cap_reached(run, node.id)
