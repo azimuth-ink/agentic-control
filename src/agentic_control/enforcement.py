@@ -258,7 +258,9 @@ class EnforcementPoint:
         """Submit to the PDP; on a PDP outage, local evaluation of the cached bundle for what 6.1 allows."""
         try:
             return self.pdp.decide(rq)
-        except Unavailable:
+        except Unavailable as e:
+            if e.component == "PIP":
+                raise          # a PIP-anchored bound cannot be evaluated anywhere: the run parks (6.1)
             return self._local_decide(rq, run, counted_locally)
 
     def _local_decide(self, rq: DecisionRequest, run: Run, counted_locally: bool = False) -> Decision:
@@ -285,10 +287,14 @@ class EnforcementPoint:
         for b in rq.node.bounds:
             if b.form == "in_scope" and rq.parameters.get(b.param) not in (run.release.scopes.get(b.scope) or []):
                 return Decision("DENY", "bounds", f"{b.param} not in scope")
-            if b.form == "limit" and b.hard is not None and rq.parameters.get(b.param, 0) > b.hard:
-                return Decision("DENY", "hard_limit", "above hard limit")
-            if b.form == "limit" and b.auto is not None and rq.parameters.get(b.param, 0) > b.auto:
-                raise Unavailable("PDP")   # a hold cannot be processed locally
+            if b.form == "limit":
+                v = rq.parameters.get(b.param, 0)
+                if not isinstance(v, (int, float)):
+                    raise Unavailable("PDP")
+                if b.hard is not None and v > b.hard:
+                    return Decision("DENY", "hard_limit", "above hard limit")
+                if b.auto is not None and v > b.auto:
+                    raise Unavailable("PDP")   # a hold cannot be processed locally
         cap = self.bundle.values.degraded_caps.get("effects_per_pep", 10)
         if not counted_locally:
             self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
@@ -507,7 +513,12 @@ class EnforcementPoint:
             self.run.approved_action_used(run, node.id, "failed")
             self._failed(run, node)
             raise NodeFailed(f"credential refused: {e}")
-        except Unavailable:
+        except Unavailable as e:
+            # no credential was obtained, so nothing was sent: a definitive negative the PEP itself knows,
+            # recorded so the node is not in doubt when the run recovers (A.5)
+            self._write(run, {"type": "effect.failed", "node_id": node.id, "purpose": "normal", "credential_presentation": presentation,
+                              "error": "not_executed", "detail": f"no credential: {e.component} unavailable", "recorded_by": "pep",
+                              "action_hash": rq.action_hash})
             if reservation:
                 self.run.release(reservation)
             raise

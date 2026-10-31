@@ -247,7 +247,8 @@ class RunCoordinator(Availability):
             return False
         if node_id in run.in_doubt_cache:
             return False
-        run.entered.append(node_id)
+        if node_id not in run.entered:
+            run.entered.append(node_id)
         if node_type == "effect":
             run.effect_node_entered = True
         run.last_heartbeat = self.clock.now()
@@ -887,6 +888,7 @@ class RunCoordinator(Availability):
 
     def resolver_resume(self, run: Run, resolver: str) -> str:
         """A resolver resumes a parked run (after a stop lifts, or after recording an outcome)."""
+        self._check()
         if run.state not in {"PARKED", "ESCALATED"}:
             raise Refused("not parked")
         for nid in list(run.entered):
@@ -902,6 +904,7 @@ class RunCoordinator(Availability):
 
     def resolver_cancel(self, run: Run, resolver: str) -> str:
         """Cancelling compensates every executed effect in reverse order; a failed or irreversible one parks."""
+        self._check()
         if run.state not in {"PARKED", "ESCALATED"}:
             raise Refused("not parked")
         return self._compensate_all(run, "resolver", resolver)
@@ -933,6 +936,7 @@ class RunCoordinator(Availability):
         return run.state
 
     def owner_close(self, run: Run, disposition: str, owner: str) -> str:
+        self._check()
         if owner != self.registry.agents[run.agent_id].owner:
             raise Refused("only the owner closes a run with an exception")
         if run.state not in {"PARKED", "ESCALATED"}:
@@ -940,6 +944,7 @@ class RunCoordinator(Availability):
         return self._close(run, disposition, owner)
 
     def owner_resume(self, run: Run, owner: str) -> str:
+        self._check()
         if owner != self.registry.agents[run.agent_id].owner or run.state != "ESCALATED":
             raise Refused("owner resume from ESCALATED only")
         run.park = None; run.escalation = None
@@ -947,6 +952,7 @@ class RunCoordinator(Availability):
         return run.state
 
     def owner_cancel(self, run: Run, owner: str) -> str:
+        self._check()
         if owner != self.registry.agents[run.agent_id].owner or run.state != "ESCALATED":
             raise Refused("owner cancel from ESCALATED only")
         return self._compensate_all(run, "owner", owner)

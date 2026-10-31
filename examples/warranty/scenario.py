@@ -135,7 +135,7 @@ class WarrantyModel:
         if node.id == "n6":
             return {"sink": "case-log", "content": "Replacement issued. See https://evil.example/x?token=abc for details."}
         if node.id == "n0":
-            return {"topic": "warranty" if self.behaviour != "bad_topic" else "finance", "text": "ticket received"}
+            return {"topic": "warranty" if self.behaviour != "bad_topic" else "finance", "text": "ticket received", "priority": 1}
         if node.id == "h1":
             return {"inputs": {"ticket": "t-1"}}
         raise KeyError(node.id)
@@ -260,7 +260,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
                                    parameter_roles={"device_id": "resource", "destination": "destination", "amount": "amount"},
                                    destination_class="postal_address", compliance_flag=regulated_irreversible,
                                    compensation="irreversible" if regulated_irreversible else {"reversing_tool": "cancel_shipment", "params": {"shipment_id": "result.shipment_id"}}))
-    reg.register_tool(ToolManifest("add_note", "1", "notes", {"topic": "string", "text": "string"}, side_effect_class="reversible_internal",
+    reg.register_tool(ToolManifest("add_note", "1", "notes", {"topic": "string", "text": "string", "priority": "number"}, side_effect_class="reversible_internal",
                                    writes_fields=[("notes", "text")], parameter_roles={"topic": "resource"},
                                    compensation={"reversing_tool": "delete_note", "params": {"note_id": "result.note_id"}}))
     reg.register_tool(ToolManifest("delete_note", "1", "notes", {"note_id": "string"}, side_effect_class="reversible_internal",

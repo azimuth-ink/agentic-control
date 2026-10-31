@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .common import Availability, Clock, Denied, Record, digest
+from .common import Unavailable, Availability, Clock, Denied, Record, digest
 from .crypto import Signer, TrustStore
 from .registry import PolicyValues, Registry, ToolManifest
 from .release import Bound, Node, Release, anchored_params
@@ -351,7 +351,7 @@ class PolicyDecisionPoint(Availability):
 
     def _pip(self) -> PIP:
         if self.pip is None:
-            raise Denied("PIP unavailable")
+            raise Unavailable("PIP")
         return self.pip
 
     def _approver_set(self, rq: DecisionRequest, amount: Any) -> tuple[list[str], int]:
