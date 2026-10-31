@@ -62,7 +62,7 @@ class Fulfilment(System):
         raise NotImplementedError(tool)
 
     def preview(self, params: dict[str, Any]) -> dict[str, Any]:
-        return {"would_ship": params.get("part_sku"), "to": params.get("destination"), "value": params.get("amount")}
+        return {"would_ship": params.get("part_sku"), "to": params.get("destination"), "value": params.get("amount"), "tainted": False}
 
 
 class MailRelay(System):
@@ -134,6 +134,10 @@ class WarrantyModel:
             return {"template_id": "tpl-shipped", "destination": self.ticket_address if self.behaviour == "inject_reply" else "cust@example.com"}
         if node.id == "n6":
             return {"sink": "case-log", "content": "Replacement issued. See https://evil.example/x?token=abc for details."}
+        if node.id == "n0":
+            return {"topic": "warranty" if self.behaviour != "bad_topic" else "finance", "text": "ticket received"}
+        if node.id == "h1":
+            return {"inputs": {"ticket": "t-1"}}
         raise KeyError(node.id)
 
 
@@ -149,13 +153,27 @@ class Scenario:
     portal_signer: Signer
     bundle: PolicyBundle
     runs: list[Any] = field(default_factory=list)
+    trigger_id: str = "fault-ticket"
+    console_signer: Signer | None = None
+    registry_signer: Signer | None = None
+    child: dict[str, Any] = field(default_factory=dict)
 
-    def start(self, customer: str = "cust-1", ticket_body: str = "My device is broken.", ticket_address: str | None = None):
-        """A subject_claim trigger: the portal authenticated the customer and signs the envelope."""
-        env = self.portal_signer.sign({"trigger_id": "fault-ticket", "kind": "subject_claim", "subject": customer, "timestamp": self.platform.clock.now()})
+    def start(self, customer: str = "cust-1", ticket_body: str = "My device is broken.", ticket_address: str | None = None,
+              trigger: str | None = None, user: str | None = None):
+        """Starts a run. Default: the subject_claim trigger from the portal (payload untrusted). `trigger`
+        may name the clean subject_claim trigger (`clean-ticket`) or the user_session trigger (`console`)."""
+        trigger = trigger or self.trigger_id
         self.systems["support_portal"].records["t-1"] = {"ticket_id": "t-1", "body": ticket_body, "address_in_body": ticket_address}
         self.model.ticket_address = ticket_address
-        run = self.platform.run.start_run(self.release, "fault-ticket", env, {"body": ticket_body}, self.pep.workload)
+        session = None
+        if trigger == "console":
+            session = self.platform.ids.create_session(user or "advisor-1")
+            env = self.console_signer.sign({"trigger_id": "console", "kind": "user_session", "timestamp": self.platform.clock.now()})
+        elif trigger == "clean-ticket":
+            env = self.registry_signer.sign({"trigger_id": "clean-ticket", "kind": "subject_claim", "subject": customer, "timestamp": self.platform.clock.now()})
+        else:
+            env = self.portal_signer.sign({"trigger_id": "fault-ticket", "kind": "subject_claim", "subject": customer, "timestamp": self.platform.clock.now()})
+        run = self.platform.run.start_run(self.release, trigger, env, {"body": ticket_body}, self.pep.workload, session_token=session)
         self.runs.append(run)
         return run
 
@@ -182,10 +200,18 @@ def policy_values(**over: Any) -> PolicyValues:
 
 
 def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy: PolicyValues | None = None,
-                   surface: str = "S2", form: str = "sidecar", tier_n4: str = "A2", ship_address_editable: bool = False) -> Scenario:
+                   surface: str = "S2", form: str = "sidecar", tier_n4: str = "A2", ship_address_editable: bool = False,
+                   internal_effect: bool = False, regulated_irreversible: bool = False, with_child: bool = False,
+                   trigger: str = "fault-ticket", publish: bool = True) -> Scenario:
+    """Variants: `internal_effect` prepends a no-factor, scope-anchored effect node (n0) for degradation
+    tests; `regulated_irreversible` makes the shipment regulated and irreversible (two-approver path);
+    `with_child` replaces the middle of the graph with a handoff to a triage agent; `trigger` selects the
+    trigger the run starts from (fault-ticket, clean-ticket, console)."""
     clock = clock or Clock()
     policy = policy or policy_values()
-    boundary = Boundary(inside_systems={"support_portal", "device_registry", "fulfilment", "mail_relay", "identity_system", "case_log", "agent_memory"},
+    if regulated_irreversible:
+        policy.two_approver_threshold = 150.0
+    boundary = Boundary(inside_systems={"support_portal", "device_registry", "fulfilment", "mail_relay", "identity_system", "case_log", "agent_memory", "notes", "console"},
                         resolvers={"postal_address": lambda v: False, "email": lambda v: str(v).endswith("@corp.internal")},
                         can_resolve_outside={"postal_address": True, "email": True})
     p = build_platform(boundary, policy, clock)
@@ -196,7 +222,9 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     mail = MailRelay("mail_relay", p.ids)
     identity_system = System.__new__(System); System.__init__(identity_system, "identity_system", p.ids, tagging=True)
     case_log = SinkStore("case_log", p.ids)
-    systems = {s.system_id: s for s in (portal, devices, fulfilment, mail, identity_system, case_log)}
+    notes = NotesSystem("notes", p.ids)
+    console = System.__new__(System); System.__init__(console, "console", p.ids)
+    systems = {s.system_id: s for s in (portal, devices, fulfilment, mail, identity_system, case_log, notes, console)}
     p.systems.update(systems)
     # records
     devices.records["dev-1"] = {"device_id": "dev-1", "owner": "cust-1", "purchased": "2026-01-10"}
@@ -216,6 +244,8 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     reg.register_system(SystemCapability("identity_system", "system_of_record", provenance_tag=True, presentation="per_agent", verified_fields={"email"},
                                          pip_relations={"address_on_file": [("identity_system", "email")]}))
     reg.register_system(SystemCapability("case_log", "sink_store"))
+    reg.register_system(SystemCapability("notes", "system_of_record", presentation="per_agent"))
+    reg.register_system(SystemCapability("console", "system_of_record", presentation="chained"))
     # tool manifests
     reg.register_tool(ToolManifest("lookup_devices", "1", "device_registry", {"device_id": "string"}, reads_data_class="confidential",
                                    parameter_roles={"device_id": "resource"}))
@@ -228,8 +258,13 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
                                    side_effect_class="reversible_internal", writes_data_class="confidential",
                                    writes_fields=[("fulfilment", "replacement_issued")],
                                    parameter_roles={"device_id": "resource", "destination": "destination", "amount": "amount"},
-                                   destination_class="postal_address",
-                                   compensation={"reversing_tool": "cancel_shipment", "params": {"shipment_id": "result.shipment_id"}}))
+                                   destination_class="postal_address", compliance_flag=regulated_irreversible,
+                                   compensation="irreversible" if regulated_irreversible else {"reversing_tool": "cancel_shipment", "params": {"shipment_id": "result.shipment_id"}}))
+    reg.register_tool(ToolManifest("add_note", "1", "notes", {"topic": "string", "text": "string"}, side_effect_class="reversible_internal",
+                                   writes_fields=[("notes", "text")], parameter_roles={"topic": "resource"},
+                                   compensation={"reversing_tool": "delete_note", "params": {"note_id": "result.note_id"}}))
+    reg.register_tool(ToolManifest("delete_note", "1", "notes", {"note_id": "string"}, side_effect_class="reversible_internal",
+                                   writes_fields=[("notes", "deleted")], parameter_roles={"note_id": "resource"}, compensation="irreversible"))
     reg.register_tool(ToolManifest("cancel_shipment", "1", "fulfilment", {"shipment_id": "string"}, side_effect_class="reversible_internal",
                                    writes_fields=[("fulfilment", "shipment_status")], parameter_roles={"shipment_id": "resource"}, compensation="irreversible"))
     reg.register_tool(ToolManifest("send_reply", "1", "mail_relay", {"template_id": "string", "destination": "string"}, side_effect_class="external",
@@ -250,35 +285,106 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     portal_signer = Signer("support-portal")
     reg.register_trigger(Trigger("fault-ticket", "support_portal", "subject_claim", signing_key=portal_signer.public(),
                                  subject_authentication="authenticated portal session", subject_schema={"subject": "customer_id"}))
+    registry_signer = Signer("device-registry")
+    reg.register_trigger(Trigger("clean-ticket", "device_registry", "subject_claim", signing_key=registry_signer.public(),
+                                 subject_authentication="registry-side authenticated lookup"))
+    console_signer = Signer("console")
+    reg.register_trigger(Trigger("console", "console", "user_session", signing_key=console_signer.public()))
+    A = "acting_user" if trigger == "console" else "subject"
+    if trigger == "console":
+        devices.records["dev-1"]["owner"] = "advisor-1"
+        identity_system.records["advisor-1"] = {"customer_id": "advisor-1", "email": "cust@example.com", "_tags": {"email": "verified"}}
     nodes = [
-        Node("n1", "read", tool="lookup_devices", bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor="subject")]),
+        Node("n1", "read", tool="lookup_devices", bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor=A)]),
         Node("n2", "loop", tools=["read_ticket", "read_purchase"], step_cap=5, token_cap=200,
-             bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor="subject")]),
+             bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor=A)]),
         Node("n3", "sanitize", sanitizer="proposal_extractor", tool="proposal_extractor"),
-        Node("n4", "effect", tool="ship_replacement", tier=tier_n4, compensate="c1", preview=True, denial_branch="n5",
-             bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor="subject"),
+        Node("n4", "effect", tool="ship_replacement", tier=tier_n4, compensate="irreversible" if regulated_irreversible else "c1", preview=True, denial_branch="n5",
+             bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor=A),
                      Bound("pred", rel="replacement_issued", param="device_id", value=False),
                      Bound("eq_rel_param", param="destination", rel="verified_ship_address", q="device_id"),
-                     Bound("limit", param="amount", auto=200.0, hard=1000.0)]),
+                     Bound("limit", param="amount", auto=100.0 if regulated_irreversible else 200.0, hard=1000.0)]),
         Node("n5", "effect", tool="send_reply", tier="A2", compensate="irreversible", template_param="template_id", denial_branch="n6",
              bounds=[Bound("in_scope", param="template_id", scope="templates"),
-                     Bound("eq_rel_anchor", param="destination", rel="address_on_file", anchor="subject")]),
+                     Bound("eq_rel_anchor", param="destination", rel="address_on_file", anchor=A)]),
         Node("n6", "output", tool="log_case", bounds=[Bound("in_scope", param="sink", scope="sinks")]),
         Node("c1", "compensate", tool="cancel_shipment", reverses="n4"),
     ]
+    if regulated_irreversible:
+        nodes = [n for n in nodes if n.id != "c1"]
+    if internal_effect:
+        nodes.insert(0, Node("n0", "effect", tool="add_note", tier="A2", compensate="c0", denial_branch="n1",
+                             bounds=[Bound("in_scope", param="topic", scope="topics")]))
+        nodes.append(Node("c0", "compensate", tool="delete_note", reverses="n0"))
+    if with_child:
+        child_agent = "triage-agent"
+        reg.register_agent(Agent(child_agent, owner="owner-2", builder="builder-2", surface=surface))
+        nodes = [Node("n1", "read", tool="lookup_devices", bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor="subject")]),
+                 Node("h1", "handoff", tool=f"agent:{child_agent}", target_agent=child_agent),
+                 Node("n6", "output", tool="log_case", bounds=[Bound("in_scope", param="sink", scope="sinks")])]
     release = Release(AGENT, "1.0", surface, form, "pep-1.0", nodes,
-                      tools={n.tool: "1" for n in nodes if n.tool}, scopes={"templates": ["tpl-shipped", "tpl-denied"], "sinks": ["case-log"], "recipients": []},
+                      tools={n.tool: "1" for n in nodes if n.tool}, scopes={"templates": ["tpl-shipped", "tpl-denied"], "sinks": ["case-log"], "recipients": [], "topics": ["warranty"]},
                       model_route=["model-a"])
-    bundle = PolicyBundle("1", policy, entitlements={AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": []}},
-                          recipient_clearance={"cust-1": "confidential"})
+    entitlements = {AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": [f"agent:triage-agent"]}}
+    if with_child:
+        entitlements["triage-agent"] = {"tools": ["read_ticket"], "systems": ["support_portal"], "agents": []}
+    bundle = PolicyBundle("1", policy, entitlements=entitlements, recipient_clearance={"cust-1": "confidential"})
     p.publish_bundle(bundle)
     p.ids.allow_build(BUILD, form)
+    p.ids.allow_build(BUILD + "-sdk", "sdk")
     p.ids.issue_agent_identity(AGENT)
-    reg.publish_release(release, policy, {"pep-1.0"})
+    if publish:
+        reg.publish_release(release, policy, {"pep-1.0"})
     pip = WarrantyPIP(devices, fulfilment, identity_system)
     p.set_pip(pip)
     pep = p.pep("wl-1", form, surface, BUILD, AGENT)
     p.ops.republish_stop_list()
     model = WarrantyModel(behaviour=behaviour)
     rt = Runtime(pep, p.run, model)
-    return Scenario(p, release, pep, rt, model, systems, pip, portal_signer, bundle)
+    sc = Scenario(p, release, pep, rt, model, systems, pip, portal_signer, bundle, trigger_id=trigger,
+                  console_signer=console_signer, registry_signer=registry_signer)
+    if with_child:
+        _wire_child(sc, "triage-agent", surface, form, policy)
+    return sc
+
+
+class NotesSystem(System):
+    def __init__(self, system_id: str, ids: Any) -> None:
+        super().__init__(system_id, ids)
+        self._n = 0
+
+    def apply(self, tool: str, params: dict[str, Any], tag: str | None) -> dict[str, Any]:
+        if tool == "add_note":
+            self._n += 1
+            nid = f"note-{self._n}"
+            self.records[nid] = {"note_id": nid, **params}
+            return {"note_id": nid}
+        if tool == "delete_note":
+            self.records.pop(params["note_id"], None)
+            return {"deleted": params["note_id"]}
+        raise NotImplementedError(tool)
+
+
+class ChildModel:
+    def propose(self, run, node: Node, ctx: dict[str, Any]) -> dict[str, Any]:
+        return {"ticket_id": "t-1"}
+
+
+def _wire_child(sc: Scenario, child_agent: str, surface: str, form: str, policy: PolicyValues) -> None:
+    """The triage agent: one read of the support portal (external ingress), so the child returns exposed."""
+    p = sc.platform
+    child_release = Release(child_agent, "1.0", surface, form, "pep-1.0",
+                            [Node("t1", "read", tool="read_ticket")], tools={"read_ticket": "1"}, model_route=["model-a"])
+    p.ids.issue_agent_identity(child_agent)
+    p.registry.publish_release(child_release, policy, {"pep-1.0"})
+    child_pep = p.pep("wl-child", form, surface, BUILD, child_agent)
+    child_rt = Runtime(child_pep, p.run, ChildModel())
+    sc.child = {"release": child_release, "pep": child_pep, "runtime": child_rt, "runs": []}
+
+    def launcher(parent, inputs, as_service, run):
+        child = run.start_run(child_release, "child", {}, inputs, "wl-child", parent=parent, as_service=as_service)
+        sc.child["runs"].append(child)
+        child_rt.execute(child)
+        return child
+
+    p.registry.agents[child_agent].launcher = launcher
