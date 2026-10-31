@@ -191,6 +191,9 @@ class RunCoordinator(Availability):
                 raise Refused("envelope does not match the registered trigger")
         if release.release_id not in self.registry.releases:
             raise Refused("unknown release")
+        stop = self.stop_in_scope(release.agent_id, release.surface, release)
+        if stop is not None:
+            raise Refused(f"stop {stop['stop_id']} in scope: no run starts under a current stop (4.9)")
         b = self.ids.workloads.get(workload)
         if b is None or b.agent_id != release.agent_id:
             raise Refused("IDS has no binding for the hosting workload and agent")
@@ -823,6 +826,35 @@ class RunCoordinator(Availability):
     # ------------------------------------------------------------------ stops (4.9)
     def record_stop(self, stop: dict[str, Any]) -> None:
         self.stop_register.append(stop)
+
+    def lift_stop(self, stop_id: str) -> None:
+        self.stop_register = [s for s in self.stop_register if s["stop_id"] != stop_id]
+
+    def stop_in_scope(self, agent_id: str, surface: str, release: Release | None = None) -> dict[str, Any] | None:
+        """A current stop in RUN's register whose scope reaches the agent, the surface, or (for a tool
+        scope) a tool the release declares."""
+        for st in self.stop_register:
+            k, v = st["scope_kind"], st["scope_value"]
+            if k == "fleet" or (k == "agent" and v == agent_id) or (k == "surface" and v == surface):
+                return st
+            if k == "tool" and release is not None and any(v in n.declared_tools() for n in release.nodes):
+                return st
+        return None
+
+    def stop_refusal(self, run: Run, node_id: str, stop_ref: str | None) -> None:
+        """The PEP refused an effect, delivery, or spawn from its own list: the run leaves RUNNING. It is
+        cancelled if no effect node was entered, else parked at that node for the resolver (4.9)."""
+        if run.state != "RUNNING":
+            return
+        run.stop_ref = stop_ref
+        run.cancelled_effects.add(node_id)
+        run.entered = [n for n in run.entered if n != node_id]
+        self._transition(run, "STOPPING", "run.stopping", cause="stop", stop_ref=stop_ref)
+        if not run.effect_node_entered:
+            self._transition(run, "CANCELLED", "run.cancelled", final_state="CANCELLED", exposed=run.exposed,
+                             data_classes_touched=sorted(run.data_classes_touched))
+        else:
+            self._park(run, f"stop {stop_ref or 'list stale'} at {node_id}", recoverable=False)
 
     def apply_stop(self, stop: dict[str, Any], in_scope) -> None:
         """Effect of a stop on runs in flight: cancel unexecuted held effects (effect.failed, stopped),

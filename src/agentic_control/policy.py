@@ -369,9 +369,14 @@ class PolicyDecisionPoint(Availability):
         orig = rq.original_ref
         if not orig or not orig.get("verified"):
             return Decision("DENY", "compensation", "original record does not verify")
-        mapping = rq.tool.compensation if isinstance(rq.tool.compensation, dict) else None
+        # the mapping is declared on the reversed effect's manifest and names this reversing tool
+        orig_node = rq.release.node(rq.node.reverses) if rq.node.reverses else None
+        orig_tool = self.registry.tools.get(orig_node.tool or "") if orig_node else None
+        mapping = orig_tool.compensation if orig_tool and isinstance(orig_tool.compensation, dict) else None
         if mapping is None:
             return Decision("DENY", "compensation", "no compensation mapping")
+        if mapping.get("reversing_tool") != rq.tool.tool_id:
+            return Decision("DENY", "compensation", "not the mapped reversing tool")
         expected = apply_mapping(mapping, orig["parameters"], orig.get("result") or {})
         if expected != rq.parameters:
             return Decision("DENY", "compensation", "parameters differ from the mapping over the recorded call")

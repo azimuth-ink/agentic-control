@@ -96,6 +96,7 @@ class Operations:
 
     def lift_stop(self, stop_id: str) -> None:
         self.stops = [s for s in self.stops if s.stop_id != stop_id]
+        self.run.lift_stop(stop_id)
         self._publish_list()
 
     def approve(self, run_obj: Any, node_id: str, approver: str) -> dict[str, Any]:

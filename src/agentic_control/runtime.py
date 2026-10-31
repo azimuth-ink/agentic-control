@@ -43,7 +43,7 @@ class Runtime:
                 continue
             except Denied as e:
                 self.trace.append((node.id, f"denied: {e}"))
-                if run.next_node == node.id:   # the PEP could not move the checkpoint (RUN down)
+                if run.state == "RUNNING" and run.next_node == node.id:   # the PEP could not move the checkpoint (RUN down)
                     run.next_node = node.denial_branch
                 if run.state == "RUNNING" and run.next_node is None:
                     try:

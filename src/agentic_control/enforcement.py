@@ -113,6 +113,20 @@ class EnforcementPoint:
             return True
         return self.stop_list is not None and self.stop_list.in_scope(run.agent_id, tool_id, run.surface) is not None
 
+    def _stop_refusal(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any], purpose: str) -> None:
+        """Enforced from the PEP's own list (A.4): the decision is recorded as denied by stop scope and the
+        run leaves RUNNING through RUN (cancelled or parked at this node, 4.9)."""
+        stop = self.stop_list.in_scope(run.agent_id, m.tool_id, run.surface) if self.stop_list else None
+        rq = self._request(run, node, m, params, purpose, {})
+        d = Decision("DENY", "stop_scope", f"stop {stop.stop_id} in scope" if stop else "stop list stale")
+        self._decision_event(run, node, rq, d, None, {}, None, None)
+        try:
+            self.run.stop_refusal(run, node.id, stop.stop_id if stop else None)
+        except Unavailable:
+            run.state = "PARKED"
+            run.park = {"reason": "stop at " + node.id, "resolver": "oncall-resolver", "deadline": None, "recoverable": False, "from": "RUNNING"}
+        raise Denied(d.reason or "stopped")
+
     # ------------------------------------------------------------------ evidence
     def _write(self, run: Run, event: dict[str, Any]) -> str:
         """Writes to EVS and waits for the durable acknowledgement; in degraded mode, to the journal."""
@@ -417,7 +431,7 @@ class EnforcementPoint:
         if node.type != "effect":
             raise Denied("effects are made only by effect nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("effect refused: stop in scope or stop list stale")
+            self._stop_refusal(run, node, m, params, "normal")
         keys = self._keys(run, m, params)
         counters: dict[str, int] = {}
         reservation: str | None = None
@@ -577,7 +591,7 @@ class EnforcementPoint:
         if node.type != "output":
             raise Denied("deliveries are made only by output nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("delivery refused under a stop")
+            self._stop_refusal(run, node, m, params, "delivery")
         rq = self._request(run, node, m, params, "delivery", {})
         d = self._decide(rq, run)
         self._decision_event(run, node, rq, d, None, {}, None, None)
@@ -604,7 +618,7 @@ class EnforcementPoint:
         if node.type not in {"handoff", "service"}:
             raise Denied("spawns are made only by handoff and service nodes")
         if self._stopped(run, m.tool_id):
-            raise Denied("spawn refused under a stop")
+            self._stop_refusal(run, node, m, params, "spawn")
         rq = self._request(run, node, m, params, "spawn", {})
         d = self._decide(rq, run)
         self._decision_event(run, node, rq, d, None, {}, None, None)
