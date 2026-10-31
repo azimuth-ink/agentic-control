@@ -382,6 +382,13 @@ class EnforcementPoint:
             raise Denied("node in doubt")
         self.heartbeat(run)
         m = self.registry.get_tool_manifest(tool_id)
+        if tool_id not in node.declared_tools():
+            # node declaration is the first rule and is recorded like any decision (A.3)
+            rq = self._request(run, node, m, params, "normal", {})
+            d = Decision("DENY", "node_declaration", f"node {node.id} does not declare tool {tool_id}")
+            self._decision_event(run, node, rq, d, None, {}, None, None)
+            self._denied(run, node)
+            raise Denied(d.reason or "undeclared tool")
         # step cap for loop nodes
         c = self.step_counts.get((run.run_id, node.id), 0) + 1
         self.step_counts[(run.run_id, node.id)] = c
