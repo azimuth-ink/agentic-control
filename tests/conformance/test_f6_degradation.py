@@ -161,7 +161,7 @@ def test_compensation_continues_through_an_evs_outage_from_runs_signed_copy():
     run = sc.start()
     sc.execute(run)
     sc.platform.outage("EVS")
-    res = sc.pep.instruct(run, "c1", "compensation", original_node="n4")
+    res = sc.platform.run.instruct_compensation(run, "n4")
     assert res["status"] == "executed"
     assert sc.systems["fulfilment"].shipments["ship-1"]["status"] == "cancelled"
     j = [e for e in sc.pep.journal.events() if e["type"] == "decision" and e["purpose"] == "compensation"]
@@ -176,15 +176,15 @@ def test_compensation_does_not_continue_through_a_run_outage():
     sc.systems["fulfilment"].fail_next = "indeterminate_but_executed"
     run = sc.start()
     sc.execute(run)
-    rc = sc.platform.run
-    rc.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
+    sc.platform.run
+    sc.platform.ops.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
     assert run.state == "PARKED"
     sc.platform.outage("RUN")
     with pytest.raises(Unavailable):
-        rc.resolver_cancel(run, "oncall-resolver")
+        sc.platform.ops.resolver_cancel(run)
     assert sc.systems["fulfilment"].shipments["ship-1"]["status"] == "created"
     sc.platform.outage("RUN", down=False)
-    assert rc.resolver_cancel(run, "oncall-resolver") == "COMPENSATED"
+    assert sc.platform.ops.resolver_cancel(run) == "COMPENSATED"
     assert sc.systems["fulfilment"].shipments["ship-1"]["status"] == "cancelled"
 
 
@@ -208,7 +208,7 @@ def test_park_deadline_escalates_and_the_owner_deadline_closes_with_compensation
     run = sc.start()
     sc.execute(run)
     assert run.state == "PARKED"
-    sc.platform.run.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
+    sc.platform.ops.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
     rc = sc.platform.run
     sc.platform.clock.advance(rc.park_deadline + 1)
     rc.tick()
@@ -216,7 +216,7 @@ def test_park_deadline_escalates_and_the_owner_deadline_closes_with_compensation
     esc = events(sc, run, "run.escalated")[-1]
     assert esc["resolver"] == "oncall-resolver" and esc["deadline"] > sc.platform.clock.now()
     with pytest.raises(Refused):
-        rc.owner_close(run, "loss_accepted", "not-the-owner")
+        sc.platform.ops.owner_close(run, "loss_accepted", "not-the-owner")
     sc.platform.clock.advance(rc.owner_deadline + 1)
     rc.tick()
     assert run.state == "CLOSED_WITH_EXCEPTION" and run.disposition == "owner_deadline_passed"
@@ -233,12 +233,12 @@ def test_owner_resumes_or_cancels_from_escalated():
     run = sc.start()
     sc.execute(run)
     rc = sc.platform.run
-    rc.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
+    sc.platform.ops.record_outcome(run, "n4", "executed", "evidence:q", {"shipment_id": "ship-1"})
     sc.platform.clock.advance(rc.park_deadline + 1)
     rc.tick()
     with pytest.raises(Refused):
-        rc.owner_cancel(run, "someone-else")
-    assert rc.owner_cancel(run, "owner-1") == "COMPENSATED"
+        sc.platform.ops.owner_cancel(run, "someone-else")
+    assert sc.platform.ops.owner_cancel(run, "owner-1") == "COMPENSATED"
     assert sc.systems["fulfilment"].shipments["ship-1"]["status"] == "cancelled"
 
 

@@ -167,6 +167,26 @@ class RunCoordinator(Availability):
         run.state = state
         self._ev(run, {"type": event, **fields})
 
+    def instruct(self, run: Run, node_id: str, purpose: str, **kw: Any) -> dict[str, Any]:
+        """Every PEP instruction (preview, resume, compensation, replay) is RUN-originated and RUN-signed;
+        the PEP refuses an instruction that does not verify (A.4, A.5)."""
+        signed = self.signer.sign({"run": run.run_id, "node": node_id, "purpose": purpose, "nonce": new_id("ins")})
+        return self._pep(run).instruct(run, node_id, purpose, instruction=signed, **kw)
+
+    def instruct_compensation(self, run: Run, original_node: str) -> dict[str, Any]:
+        """Compensation of one executed effect, as the cancel path performs it (4.9); exposed for resolvers
+        and tests acting as RUN."""
+        node = run.release.node(original_node)
+        if node.compensate in (None, "irreversible"):
+            return {"status": "denied", "reason": "effect declared irreversible"}
+        return self.instruct(run, node.compensate, "compensation", original_node=original_node)
+
+    def _person(self, assertion: dict[str, Any]) -> str:
+        """A person acts through OPS with an identity-provider assertion; RUN verifies it (A.9, I8)."""
+        if not isinstance(assertion, dict) or not self.trust.verify(assertion, role="identity_provider"):
+            raise Refused("identity-provider assertion does not verify")
+        return assertion["payload"]["approver"]
+
     def register_pep(self, workload: str, pep: "EnforcementPoint") -> None:
         self.peps[workload] = pep
 
@@ -208,13 +228,15 @@ class RunCoordinator(Availability):
             elif trig.kind == "user_session":
                 if not session_token:
                     raise Refused("user_session trigger without a session token")
-                run.acting_user = self.ids.exchange(session_token)["acting_user"]
+                run.acting_user = self.ids.exchange(session_token, run.run_id)["acting_user"]
             trust = self.registry.payload_trust(trig)
             run.exposed = trust == "untrusted" or (trust == "per_item" and any(v.get("tainted") for v in payload.values() if isinstance(v, dict)))
             run.agents = [release.agent_id]
         else:
             run.subject = parent.subject
             run.acting_user = parent.acting_user
+            if parent.acting_user is not None:
+                self.ids.exchange_child(parent.run_id, run.run_id)     # exchange(run_ref, target_agent): the parent's delegation state
             if as_service:
                 run.agents = list(parent.agents)
                 run.service_identity = release.agent_id
@@ -282,6 +304,9 @@ class RunCoordinator(Availability):
         self._check()
         if node_id not in run.entered:
             raise Denied(f"checkpoint for {node_id} without its node_entered hook")
+        node = run.release.node(node_id)
+        if branch is not None and branch not in {node.denial_branch, node.failure_branch}:
+            raise Denied(f"{branch} is not a declared branch of {node_id}")
         run.outputs[node_id] = outputs
         run.exited.add(node_id)
         run.in_doubt_cache.discard(node_id)
@@ -456,11 +481,11 @@ class RunCoordinator(Availability):
                 return h
         run.holds[node.id] = h
         # preview, PEP-originated, decided like any read
-        pep = self._pep(run)
+        self._pep(run)
         sysc = self.registry.systems.get(self.registry.tools[node.tool].target_system)
         if node.preview and sysc and sysc.preview_tool:
             try:
-                res = pep.instruct(run, node.id, "preview", parameters=pending["parameters"])
+                res = self.instruct(run, node.id, "preview", parameters=pending["parameters"])
                 h.preview_ref = res.get("result_ref")
             except (Denied, Unavailable, Refused):
                 h.preview_ref = None
@@ -486,9 +511,14 @@ class RunCoordinator(Availability):
                        "approver_set": h.approver_set, "substitution_only": False, "view_ref": h.view_ref})
         return h
 
-    def provide_input(self, run: Run, node_id: str, value: Any, role: str) -> None:
-        """Input from a human node enters through RUN and is tainted unless the input role is registered as internal."""
+    def provide_input(self, run: Run, node_id: str, value: Any, assertion: dict[str, Any]) -> None:
+        """Input from a human node enters through RUN with an identity-provider assertion of the person and
+        their role; it is tainted unless that role is registered as internal (5.1, A.5)."""
+        self._person(assertion)
+        role = assertion["payload"].get("role", "")
         h = run.holds[node_id]
+        if h.kind != "input" or h.status != "open" or run.state != "HELD":
+            raise Refused("no open input hold")
         agent = self.registry.agents[run.agent_id]
         tainted = role not in agent.input_roles_internal
         if tainted:
@@ -557,7 +587,7 @@ class RunCoordinator(Availability):
         if run.state == "HELD":
             self._transition(run, "RUNNING", "run.resumed", cause="approved")
             try:
-                return self._pep(run).instruct(run, node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
+                return self.instruct(run, node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
             except Unavailable as e:
                 # the approval stands; the resume is retried on recovery with the record (6.1)
                 self._park(run, f"{e.component} unreachable at resume", recoverable=True)
@@ -665,7 +695,7 @@ class RunCoordinator(Availability):
         run.in_doubt_cache.add(node_id)
         while sysc.idempotency and run.replay_attempts.get(node_id, 0) < self.policy.consecutive_replays:
             run.replay_attempts[node_id] = run.replay_attempts.get(node_id, 0) + 1
-            res = self._pep(run).instruct(run, node_id, "replay")
+            res = self.instruct(run, node_id, "replay")
             status = res.get("status")
             if status == "executed":
                 self._node_resolved_executed(run, node_id, res.get("outputs"))
@@ -688,10 +718,29 @@ class RunCoordinator(Availability):
         self._park(run, "effect in doubt needs a resolver", recoverable=False)
         return "parked"
 
+    def _resolver(self, run: Run, assertion: dict[str, Any]) -> str:
+        person = self._person(assertion)
+        expected = (run.park or {}).get("resolver") or self.resolver
+        if person != expected:
+            raise Refused(f"{person} is not the resolver of this run")
+        return person
+
+    def _owner(self, run: Run, assertion: dict[str, Any]) -> str:
+        person = self._person(assertion)
+        if person != self.registry.agents[run.agent_id].owner:
+            raise Refused("only the owner closes, resumes, or cancels a run with an exception")
+        return person
+
     def record_outcome(self, run: Run, node_id: str, outcome: str, evidence_ref: str,
-                       result_fields: dict[str, Any] | None = None) -> None:
+                       result_fields: dict[str, Any] | None = None, assertion: dict[str, Any] | None = None) -> None:
         """A resolver verifies against the system and records the outcome; RUN writes the matching
         effect event with recorded_by = resolver."""
+        self._check()
+        if run.state not in {"PARKED", "ESCALATED"}:
+            raise Refused("outcomes are recorded on a parked run")
+        if not self.in_doubt(run, node_id):
+            raise Refused(f"{node_id} is not in doubt")
+        resolver = self._resolver(run, assertion)
         node = run.release.node(node_id)
         tool = self.registry.tools[node.tool]
         evs = self.evs.read_unchecked(run.run_id)
@@ -700,14 +749,14 @@ class RunCoordinator(Availability):
         presentation = self.registry.systems[tool.target_system].presentation
         if outcome == "executed":
             self._ev(run, {"type": "effect.executed", "node_id": node_id, "purpose": "normal", "credential_presentation": presentation,
-                           "result_ref": evidence_ref, "recorded_by": "resolver", "action_hash": ah})
+                           "result_ref": evidence_ref, "recorded_by": "resolver", "resolver": resolver, "action_hash": ah})
             self.effect_confirmed(run, EffectRecord(node_id, ah, decisions[-1]["event_id"] if decisions else "",
                                                     decisions[-1].get("parameters", {}) if decisions else {}, result_fields or {},
                                                     evidence_ref, [], tool.tool_id))
             self._node_resolved_executed(run, node_id, result_fields or {})
         else:
             self._ev(run, {"type": "effect.failed", "node_id": node_id, "purpose": "normal", "credential_presentation": presentation,
-                           "error": "not_executed", "recorded_by": "resolver", "action_hash": ah})
+                           "error": "not_executed", "recorded_by": "resolver", "resolver": resolver, "action_hash": ah})
             run.not_executed.add(node_id)
             run.in_doubt_cache.discard(node_id)
             run.entered = [n for n in run.entered if n != node_id]
@@ -775,7 +824,7 @@ class RunCoordinator(Availability):
                 if self._approval_expired(h):
                     return self._reopen_expired(run, h)
                 self._transition(run, "RUNNING", "run.resumed", cause="recovered")
-                self._pep(run).instruct(run, h.node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
+                self.instruct(run, h.node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
                 return run.state
             if h and h.grant_id is None and not h.substitution_only:
                 try:
@@ -940,11 +989,12 @@ class RunCoordinator(Availability):
                 if run.state == "STOPPING":
                     self._park(run, f"stop {stop['stop_id']}", recoverable=False)
 
-    def resolver_resume(self, run: Run, resolver: str) -> str:
+    def resolver_resume(self, run: Run, assertion: dict[str, Any]) -> str:
         """A resolver resumes a parked run (after a stop lifts, or after recording an outcome)."""
         self._check()
         if run.state not in {"PARKED", "ESCALATED"}:
             raise Refused("not parked")
+        resolver = self._resolver(run, assertion)
         for nid in list(run.entered):
             if self.in_doubt(run, nid):
                 raise Refused("resolve effects in doubt first")
@@ -956,16 +1006,16 @@ class RunCoordinator(Availability):
             run.entered = [n for n in run.entered if n != nid]
         return run.state
 
-    def resolver_cancel(self, run: Run, resolver: str) -> str:
+    def resolver_cancel(self, run: Run, assertion: dict[str, Any]) -> str:
         """Cancelling compensates every executed effect in reverse order; a failed or irreversible one parks."""
         self._check()
         if run.state not in {"PARKED", "ESCALATED"}:
             raise Refused("not parked")
+        resolver = self._resolver(run, assertion)
         return self._compensate_all(run, "resolver", resolver)
 
     def _compensate_all(self, run: Run, cause: str, actor: str, unconditional: bool = False) -> str:
         self._transition(run, "COMPENSATING", "run.compensating", cause=cause, decided_by=actor)
-        pep = self._pep(run)
         for rec in reversed(run.effects):
             if not rec.executed:
                 continue
@@ -975,7 +1025,7 @@ class RunCoordinator(Availability):
                     continue
                 self._park(run, f"effect {rec.node_id} is irreversible", recoverable=False)
                 return run.state
-            res = pep.instruct(run, node.compensate, "compensation", original_node=rec.node_id)
+            res = self.instruct(run, node.compensate, "compensation", original_node=rec.node_id)
             if res.get("status") != "executed":
                 if unconditional:
                     self.notifications.append(f"compensation of {rec.node_id} failed during the OPS close; recorded, not re-parked")
@@ -989,25 +1039,26 @@ class RunCoordinator(Availability):
                          data_classes_touched=sorted(run.data_classes_touched))
         return run.state
 
-    def owner_close(self, run: Run, disposition: str, owner: str) -> str:
+    def owner_close(self, run: Run, disposition: str, assertion: dict[str, Any]) -> str:
         self._check()
-        if owner != self.registry.agents[run.agent_id].owner:
-            raise Refused("only the owner closes a run with an exception")
+        owner = self._owner(run, assertion)
         if run.state not in {"PARKED", "ESCALATED"}:
             raise Refused("not parked or escalated")
         return self._close(run, disposition, owner)
 
-    def owner_resume(self, run: Run, owner: str) -> str:
+    def owner_resume(self, run: Run, assertion: dict[str, Any]) -> str:
         self._check()
-        if owner != self.registry.agents[run.agent_id].owner or run.state != "ESCALATED":
+        owner = self._owner(run, assertion)
+        if run.state != "ESCALATED":
             raise Refused("owner resume from ESCALATED only")
         run.park = None; run.escalation = None
         self._transition(run, "RUNNING", "run.resumed", cause="owner", decided_by=owner)
         return run.state
 
-    def owner_cancel(self, run: Run, owner: str) -> str:
+    def owner_cancel(self, run: Run, assertion: dict[str, Any]) -> str:
         self._check()
-        if owner != self.registry.agents[run.agent_id].owner or run.state != "ESCALATED":
+        owner = self._owner(run, assertion)
+        if run.state != "ESCALATED":
             raise Refused("owner cancel from ESCALATED only")
         return self._compensate_all(run, "owner", owner)
 
@@ -1062,8 +1113,10 @@ class RunCoordinator(Availability):
             run.next_node = target
 
     def cancel(self, run: Run) -> None:
-        """cancel(run) from the contract: used by a resolver through resolver_cancel."""
-        self.resolver_cancel(run, self.resolver)
+        """cancel(run) from the contract: RUN's own cancellation (used by OPS on its own authority)."""
+        if run.state not in {"PARKED", "ESCALATED"}:
+            raise Refused("not parked")
+        self._compensate_all(run, "resolver", self.resolver)
 
     # ------------------------------------------------------------------ child runs (4.7, A.2)
     def spawn(self, parent: Run, node: Node, inputs: dict[str, Any]) -> Run:

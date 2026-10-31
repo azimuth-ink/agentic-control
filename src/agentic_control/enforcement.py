@@ -90,7 +90,8 @@ class EnforcementPoint:
         self.stop_list: StopList | None = None
         self.stop_list_signed: dict[str, Any] | None = None
         self.pending: dict[tuple[str, str], PendingEffect] = {}
-        self.manifest_cache: dict[str, tuple[ToolManifest, float]] = {}       # (run_id, node_id) -> pending held effect
+        self.manifest_cache: dict[str, tuple[ToolManifest, float]] = {}
+        self.used_instructions: set[str] = set()
         self.sanitized: dict[str, set[str]] = {}                       # run_id -> accepted value hashes
         self.credential_cache: dict[tuple[str, str, str], dict[str, Any]] = {}  # (run, node, audience)
         self.capped_nodes: set[tuple[str, str]] = set()
@@ -170,9 +171,26 @@ class EnforcementPoint:
         return evs
 
     # ------------------------------------------------------------------ node lifecycle (hook contract)
+    def _resolve(self, run: Run, node: Node | None = None) -> tuple[Run, Node | None]:
+        """The runtime is builder code: the PEP acts on RUN's run record and the release's node, never on
+        objects the runtime hands it (A.4, A.5)."""
+        real = self.run.runs.get(run.run_id)
+        if real is None:
+            raise Denied(f"unknown run {run.run_id}")
+        if node is None:
+            return real, None
+        try:
+            return real, real.release.node(node.id)
+        except KeyError:
+            raise Denied(f"node {node.id} is not in the release")
+
     def enter_node(self, run: Run, node: Node, inputs: Any) -> None:
-        """PEP-E calls the node_entered hook itself; the PEP rejects calls for a node until RUN confirms it."""
-        inputs_ref = self._payload(inputs)
+        """PEP-E calls the node_entered hook itself; the PEP rejects calls for a node until RUN confirms it.
+        The inputs reference is built by the PEP from the run's recorded outputs and taint, not from a
+        runtime claim (Appendix D, node.entered)."""
+        run, node = self._resolve(run, node)
+        inputs_ref = self._payload({"outputs": {k: v for k, v in run.outputs.items()}, "exposed": run.exposed,
+                                    "tainted_reads": list(run.tainted_reads), "runtime_claim": inputs})
         try:
             ok = self.run.node_entered(run, node.id, node.type, inputs_ref)
             if not ok:
@@ -194,6 +212,9 @@ class EnforcementPoint:
         self.step_counts[(run.run_id, node.id)] = 0
 
     def exit_node(self, run: Run, node: Node, outputs: Any, branch: str | None = None) -> None:
+        run, node = self._resolve(run, node)
+        if branch is not None and branch not in {node.denial_branch, node.failure_branch}:
+            raise Denied(f"{branch} is not a declared branch of {node.id}")
         if self.form != "proxy":
             self._write(run, {"type": "node.exited", "node_id": node.id, "outputs_ref": self._payload(outputs),
                               "data_classes_touched": sorted(run.data_classes_touched), "exposed": run.exposed, "written_by": "pep"})
@@ -409,6 +430,7 @@ class EnforcementPoint:
     # ------------------------------------------------------------------ the call
     def call(self, run: Run, node: Node, tool_id: str, params: dict[str, Any], origin: str = "runtime") -> Any:
         """A runtime-originated call. Returns the result, raises Denied, Held, or NodeFailed."""
+        run, node = self._resolve(run, node)
         if run.state != "RUNNING":
             raise Denied(f"run is {run.state}; a held or parked run makes no runtime-originated calls")
         if node.id not in run.entered and node.id not in self.local_entered.get(run.run_id, []):
@@ -772,8 +794,42 @@ class EnforcementPoint:
             self._write(run, {"type": "taint.applied", "source": f"child:{child.run_id}", "items": [node.id]})
         return {"child_run": child.run_id, "state": child.state, "outputs": child.outputs, "exposed": child.exposed}
 
+    # ------------------------------------------------------------------ what the runtime may ask of RUN, through the PEP
+    def end_if_no_next_node(self, run: Run) -> None:
+        """After a denial with no branch declared, the run ends on that branch (4.2)."""
+        run, _ = self._resolve(run)
+        if run.state == "RUNNING" and run.next_node is None:
+            try:
+                self.run._complete(run)
+            except Unavailable:
+                pass
+
+    def node_indeterminate(self, run: Run, node: Node) -> None:
+        """The runtime saw an indeterminate outcome; RUN resolves the node (replay or park)."""
+        run, node = self._resolve(run, node)
+        try:
+            self.run.resolve_in_doubt(run, node.id)
+        except Unavailable:
+            pass
+
+    def park(self, run: Run, reason: str) -> None:
+        run, _ = self._resolve(run)
+        try:
+            self.run.park(run, reason)
+        except Unavailable:
+            run.state = "PARKED"
+            run.park = {"reason": reason, "resolver": "oncall-resolver", "deadline": None, "recoverable": True, "from": "RUNNING"}
+
+    def denial_branch_locally(self, run: Run, node: Node) -> None:
+        """RUN down: the PEP could not move the checkpoint; the local next-node rule follows the branch."""
+        run, node = self._resolve(run, node)
+        if run.state == "RUNNING" and run.next_node == node.id:
+            run.next_node = node.denial_branch
+            self.local_checkpoint[run.run_id] = run.next_node
+
     # ------------------------------------------------------------------ model calls
     def model_call(self, run: Run, node: Node, model: str, prompt: str, tokens: int = 100) -> str:
+        run, node = self._resolve(run, node)
         if self.mgw is None:
             raise Denied("no model gateway")
         if node.type not in {"read", "loop", "effect", "output"}:
@@ -799,8 +855,18 @@ class EnforcementPoint:
         self.capped_nodes.add((run.run_id, node_id))
 
     # ------------------------------------------------------------------ RUN-originated instructions
-    def instruct(self, run: Run, node_id: str, purpose: str, **kw: Any) -> dict[str, Any]:
-        """instruct(run, node, purpose ∈ {preview, compensation, replay, resume}, original_ref?, approval_ref?, grant?)."""
+    def instruct(self, run: Run, node_id: str, purpose: str, instruction: dict[str, Any] | None = None, **kw: Any) -> dict[str, Any]:
+        """instruct(run, node, purpose ∈ {preview, resume, compensation, replay}, ...). Only RUN instructs:
+        the instruction is RUN-signed, names this run, node and purpose, and is used once."""
+        if instruction is None or not self.trust.verify(instruction, role="run"):
+            raise Denied("instruction is not RUN-signed")
+        ins = instruction["payload"]
+        if ins.get("run") != run.run_id or ins.get("node") != node_id or ins.get("purpose") != purpose:
+            raise Denied("instruction does not name this run, node and purpose")
+        if ins.get("nonce") in self.used_instructions:
+            raise Denied("instruction already used")
+        self.used_instructions.add(ins.get("nonce"))
+        run, _ = self._resolve(run)
         self.instructions.append({"run": run.run_id, "node": node_id, "purpose": purpose})
         node = run.release.node(node_id)
         if purpose == "preview":

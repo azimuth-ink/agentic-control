@@ -102,7 +102,7 @@ def test_human_input_from_a_non_internal_role_taints(scenario):
     run = scenario.start(trigger="clean-ticket")
     assert run.exposed is False
     scenario.platform.run.input_hold(run, Node("hx", "human", input_role="customer"))
-    scenario.platform.run.provide_input(run, "hx", "pasted email content", role="customer")
+    scenario.platform.ops.provide_input(run, "hx", "pasted email content", person="cust-1", role="customer")
     assert run.exposed is True and any(t.startswith("human:") for t in run.tainted_reads)
 
 

@@ -107,6 +107,29 @@ class Operations:
     def deny(self, run_obj: Any, node_id: str, approver: str) -> dict[str, Any]:
         return self.run.deny(run_obj, node_id, approver)
 
+    # people act through OPS with an identity-provider assertion (A.9); RUN verifies it
+    def provide_input(self, run_obj: Any, node_id: str, value: Any, person: str, role: str) -> None:
+        self.run.provide_input(run_obj, node_id, value, self.ids.approver_assertion(person, role))
+
+    def record_outcome(self, run_obj: Any, node_id: str, outcome: str, evidence_ref: str,
+                       result_fields: dict[str, Any] | None = None, resolver: str = "oncall-resolver") -> None:
+        self.run.record_outcome(run_obj, node_id, outcome, evidence_ref, result_fields, self.ids.approver_assertion(resolver))
+
+    def resolver_resume(self, run_obj: Any, resolver: str = "oncall-resolver") -> str:
+        return self.run.resolver_resume(run_obj, self.ids.approver_assertion(resolver))
+
+    def resolver_cancel(self, run_obj: Any, resolver: str = "oncall-resolver") -> str:
+        return self.run.resolver_cancel(run_obj, self.ids.approver_assertion(resolver))
+
+    def owner_close(self, run_obj: Any, disposition: str, owner: str) -> str:
+        return self.run.owner_close(run_obj, disposition, self.ids.approver_assertion(owner))
+
+    def owner_resume(self, run_obj: Any, owner: str) -> str:
+        return self.run.owner_resume(run_obj, self.ids.approver_assertion(owner))
+
+    def owner_cancel(self, run_obj: Any, owner: str) -> str:
+        return self.run.owner_cancel(run_obj, self.ids.approver_assertion(owner))
+
     def recovery(self, identity: str, two_approvers: tuple[str, str], incident: str, actions: list[str]) -> dict[str, Any]:
         """Every recovery release opens an incident; actions are recorded as recovery.used."""
         cred = self.ids.release_recovery_identity(identity, two_approvers, incident)

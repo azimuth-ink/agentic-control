@@ -47,7 +47,7 @@ def test_replay_count_exhausted_parks_with_a_resolver():
     assert run.state == "PARKED" and "resolver" in run.park["reason"]
     assert not run.park["recoverable"]
     with pytest.raises(Refused):
-        sc.platform.run.resolver_resume(run, "oncall-resolver")          # effects in doubt first
+        sc.platform.ops.resolver_resume(run)          # effects in doubt first
 
 
 @spec("4.6", "A.5", "D", finding="F5")
@@ -56,11 +56,11 @@ def test_resolver_records_not_executed_and_the_node_is_re_entered():
     sc.systems["fulfilment"].fail_next = "indeterminate"
     run = sc.start()
     sc.execute(run)
-    sc.platform.run.record_outcome(run, "n4", "not_executed", "evidence:fulfilment-query")
+    sc.platform.ops.record_outcome(run, "n4", "not_executed", "evidence:fulfilment-query")
     failed = events(sc, run, "effect.failed", "n4")[-1]
     assert failed["error"] == "not_executed" and failed["recorded_by"] == "resolver"
     assert run.next_node == "n4" and "n4" not in run.in_doubt_cache
-    sc.platform.run.resolver_resume(run, "oncall-resolver")
+    sc.platform.ops.resolver_resume(run)
     sc.execute(run)
     assert run.state == "COMPLETED" and len(sc.systems["fulfilment"].shipments) == 1
     # the second attempt was a fresh decision with a new reservation
@@ -74,11 +74,11 @@ def test_resolver_records_executed_and_the_run_moves_on():
     run = sc.start()
     sc.execute(run)
     assert run.state == "PARKED"
-    sc.platform.run.record_outcome(run, "n4", "executed", "evidence:fulfilment-query", {"shipment_id": "ship-1"})
+    sc.platform.ops.record_outcome(run, "n4", "executed", "evidence:fulfilment-query", {"shipment_id": "ship-1"})
     ex = events(sc, run, "effect.executed", "n4")[-1]
     assert ex["recorded_by"] == "resolver"
     assert "n4" in run.exited and run.next_node == "n5"
-    sc.platform.run.resolver_resume(run, "oncall-resolver")
+    sc.platform.ops.resolver_resume(run)
     sc.execute(run)
     assert run.state == "COMPLETED" and len(sc.systems["fulfilment"].calls) == 1
 
@@ -97,7 +97,7 @@ def test_a_stop_cancels_an_unexecuted_held_effect_as_failed_not_in_doubt():
     assert run.state == "PARKED" and run.stop_ref == stop.stop_id
     assert not sc.platform.run.in_doubt(run, "n4")
     sc.platform.ops.lift_stop(stop.stop_id)
-    sc.platform.run.resolver_resume(run, "oncall-resolver")
+    sc.platform.ops.resolver_resume(run)
     assert run.next_node == "n4"
     sc.execute(run)
     assert run.state == "HELD"                                            # decided afresh: the band still holds
@@ -123,7 +123,7 @@ def test_under_a_stop_no_run_starts_and_compensation_still_runs():
     with pytest.raises(Refused, match="stop"):
         sc.start()
     # compensation of the completed run's shipment is instructed by RUN and allowed under the stop
-    res = sc.pep.instruct(run, "c1", "compensation", original_node="n4")
+    res = sc.platform.run.instruct_compensation(run, "n4")
     assert res["status"] == "executed"
     assert sc.systems["fulfilment"].shipments["ship-1"]["status"] == "cancelled"
     sc.platform.ops.lift_stop(stop.stop_id)
