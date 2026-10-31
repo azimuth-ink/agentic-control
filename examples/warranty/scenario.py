@@ -323,7 +323,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     if with_child:
         child_agent = "triage-agent"
         reg.register_agent(Agent(child_agent, owner="owner-2", builder="builder-2", surface=surface))
-        nodes = [Node("n1", "read", tool="lookup_devices", bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor="subject")]),
+        nodes = [Node("n1", "read", tool="lookup_devices", bounds=[Bound("anchor_rel", param="device_id", rel="owner", anchor=A)]),
                  Node("h1", "handoff", tool=f"agent:{child_agent}", target_agent=child_agent),
                  Node("n6", "output", tool="log_case", bounds=[Bound("in_scope", param="sink", scope="sinks")])]
     release = Release(AGENT, "1.0", surface, form, "pep-1.0", nodes,
@@ -344,7 +344,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     pep = p.pep("wl-1", form, surface, BUILD, AGENT)
     p.ops.republish_stop_list()
     model = WarrantyModel(behaviour=behaviour)
-    rt = Runtime(pep, p.run, model)
+    rt = Runtime(pep, model)
     sc = Scenario(p, release, pep, rt, model, systems, pip, portal_signer, bundle, trigger_id=trigger,
                   console_signer=console_signer, registry_signer=registry_signer)
     if with_child:
@@ -382,7 +382,7 @@ def _wire_child(sc: Scenario, child_agent: str, surface: str, form: str, policy:
     p.ids.issue_agent_identity(child_agent)
     p.registry.publish_release(child_release, policy, {"pep-1.0"})
     child_pep = p.pep("wl-child", form, surface, BUILD, child_agent)
-    child_rt = Runtime(child_pep, p.run, ChildModel())
+    child_rt = Runtime(child_pep, ChildModel())
     sc.child = {"release": child_release, "pep": child_pep, "runtime": child_rt, "runs": []}
 
     def launcher(parent, inputs, as_service, run):

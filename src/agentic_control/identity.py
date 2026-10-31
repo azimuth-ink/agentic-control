@@ -57,6 +57,7 @@ class IdentityService(Availability):
         self.revoked_agents: set[str] = set()
         self.revoked_runs: set[str] = set()
         self.issued: list[dict[str, Any]] = []
+        self.run_users: dict[str, str] = {}          # run id -> acting user (the run's delegation state)
         self.identity_provider = Signer("identity-provider")
         trust.trust(self.identity_provider, "identity_provider")
 
@@ -104,13 +105,25 @@ class IdentityService(Availability):
         self.delegations[user] = "valid"
         return tok
 
-    def exchange(self, session_token: str) -> dict[str, Any]:
-        """Exchanges a user's session token for the acting user it names (the delegated chain head)."""
+    def exchange(self, session_token: str, run_id: str) -> dict[str, Any]:
+        """Exchanges a user's session token for the acting user it names (the delegated chain head) and
+        records the run's delegation state, which later credentials are issued against."""
         self._check()
         user = self.sessions.get(session_token)
         if user is None:
             raise Refused("unknown session")
+        if self.delegations.get(user) != "valid":
+            raise Refused("delegation revoked")
+        self.run_users[run_id] = user
         return {"acting_user": user}
+
+    def exchange_child(self, parent_run_id: str, child_run_id: str) -> None:
+        """A child run's credentials are requested against the parent run's delegation state."""
+        self._check()
+        user = self.run_users.get(parent_run_id)
+        if user is None:
+            raise Refused("parent run has no delegation state")
+        self.run_users[child_run_id] = user
 
     def delegation_status(self, user: str | None) -> str:
         self._check()
@@ -123,14 +136,20 @@ class IdentityService(Availability):
 
     # ------------------------------------------------------------------ credentials
     def issue_credential(self, workload: str, run: str, release: dict[str, Any], node: str, call: dict[str, Any],
-                         principal_chain: dict[str, Any], audience: str, purpose: str) -> dict[str, Any]:
+                         principal_chain: dict[str, Any], audience: str, purpose: str, _substitution: bool = False) -> dict[str, Any]:
         """purpose ∈ {normal, compensation, replay, model}. Refuses when the release's declared form or
-        surface differs from the attested workload's (caps cannot be evaded by declaration)."""
+        surface differs from the attested workload's (caps cannot be evaded by declaration), and when the
+        chain names an acting user this run has no delegation from (IDS holds the run's delegation state)."""
         self._check()
         b = self._binding(workload)
         self._identity_current(b.agent_id)
+        if b.build_hash not in self.allowlist:
+            raise Refused("PEP build hash is no longer on the allow-list")
         if run in self.revoked_runs:
             raise Refused("run revoked")
+        acting_claim = principal_chain.get("acting_user")
+        if acting_claim is not None and not _substitution and self.run_users.get(run) != acting_claim:
+            raise Refused("chain names an acting user this run has no delegation from")
         if release.get("pep_form") != b.form:
             raise Refused(f"release declares form {release.get('pep_form')} but the attested build is {b.form}")
         if release.get("surface") != b.surface:
@@ -138,7 +157,7 @@ class IdentityService(Availability):
         if release.get("agent_id") != b.agent_id:
             raise Refused("release belongs to another agent")
         acting = principal_chain.get("acting_user")
-        if purpose == "normal" and acting is not None and self.delegations.get(acting) != "valid":
+        if purpose == "normal" and acting is not None and not _substitution and self.delegations.get(acting) != "valid":
             raise Refused("revoked")
         now = self.clock.now()
         cred = {
@@ -159,12 +178,18 @@ class IdentityService(Availability):
         if not self.trust.verify(signed, role="ids"):
             return False
         c = signed["payload"]
+        if c["run"] in self.revoked_runs or c["agent_id"] in self.revoked_agents:
+            return False
         return c["workload"] == presenter_workload and c["audience"] == audience and c["expires_at"] >= self.clock.now()
 
     # ------------------------------------------------------------------ approval records and grants
-    def approver_assertion(self, approver: str) -> dict[str, Any]:
-        """The identity provider's assertion of the approver, forwarded by OPS."""
-        return self.identity_provider.sign({"approver": approver, "at": self.clock.now()})
+    def approver_assertion(self, approver: str, role: str | None = None) -> dict[str, Any]:
+        """The identity provider's assertion of a person (an approver, resolver, owner, or a human-node
+        input role), forwarded by OPS."""
+        payload: dict[str, Any] = {"approver": approver, "at": self.clock.now()}
+        if role is not None:
+            payload["role"] = role
+        return self.identity_provider.sign(payload)
 
     def mint_resumption_grant(self, run_id: str, node_id: str, action_hash: str, agent_id: str) -> tuple[str, str]:
         """Single-use, bound to the action hash, audience IDS, sealed, stored by RUN. No clock inside."""
@@ -254,11 +279,11 @@ class IdentityService(Availability):
         if exp:
             return {"status": "expired", "reason": exp}
         approver = ap["approver_assertion"]["payload"]["approver"]
-        self.delegations.setdefault(approver, "valid")
         b = self._binding(workload)
+        # the approver's own authority for this one action: no standing delegation is written
         cred = self.issue_credential(workload, st["run_id"], ap["release"], st["node_id"], {"action_hash": ap["action_hash"]},
                                      {"acting_user": approver, "agents": ap["agents"], "requested_principal": ap.get("acting_user")},
-                                     ap["audience"], "normal")
+                                     ap["audience"], "normal", _substitution=True)
         self.approved_action_issuances.append({"approval_ref": ap["approval_ref"], "action_hash": ap["action_hash"],
                                                "presenter_workload": workload, "agent": b.agent_id})
         return {"status": "ok", "credential": cred}

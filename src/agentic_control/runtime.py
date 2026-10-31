@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from .common import Denied, Unavailable
-from .coordinator import Run, RunCoordinator
+from .coordinator import Run
 from .dbs import Indeterminate
 from .enforcement import EnforcementPoint, Held, NodeFailed
 from .release import Node
@@ -22,9 +22,10 @@ class Model(Protocol):
 
 
 class Runtime:
-    def __init__(self, pep: EnforcementPoint, run: RunCoordinator, model: Model, model_name: str = "model-a") -> None:
+    """A minimal agent runtime: builder code. It holds a PEP and a model, nothing of the control plane."""
+
+    def __init__(self, pep: EnforcementPoint, model: Model, model_name: str = "model-a") -> None:
         self.pep = pep
-        self.run = run
         self.model = model
         self.model_name = model_name
         self.trace: list[tuple[str, str]] = []
@@ -43,30 +44,18 @@ class Runtime:
                 continue
             except Denied as e:
                 self.trace.append((node.id, f"denied: {e}"))
-                if run.state == "RUNNING" and run.next_node == node.id:   # the PEP could not move the checkpoint (RUN down)
-                    run.next_node = node.denial_branch
-                if run.state == "RUNNING" and run.next_node is None:
-                    try:
-                        self.run._complete(run)
-                    except Unavailable:
-                        pass
+                self.pep.denial_branch_locally(run, node)
+                self.pep.end_if_no_next_node(run)
                 continue
             except Indeterminate:
                 self.trace.append((node.id, "indeterminate"))
-                try:
-                    self.run.resolve_in_doubt(run, node.id)
-                except Unavailable:
-                    pass
+                self.pep.node_indeterminate(run, node)
                 if run.state == "RUNNING" and node.id in run.exited:
                     continue
                 return run.state
             except Unavailable as e:
                 self.trace.append((node.id, f"unavailable: {e.component}"))
-                try:
-                    self.run.park(run, f"{e.component} unavailable")
-                except Unavailable:
-                    run.state = "PARKED"
-                    run.park = {"reason": f"{e.component} unavailable", "resolver": "oncall-resolver", "deadline": None, "recoverable": True, "from": "RUNNING"}
+                self.pep.park(run, f"{e.component} unavailable")
                 return run.state
         return run.state
 

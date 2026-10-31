@@ -183,7 +183,7 @@ def test_a_replay_refused_by_the_system_keeps_the_node_in_doubt_for_a_resolver()
     failed = events(sc, run, "effect.failed", "n4")
     assert failed and failed[-1]["purpose"] == "replay"
     with pytest.raises(Refused):
-        sc.platform.run.resolver_resume(run, "oncall-resolver")
+        sc.platform.ops.resolver_resume(run)
 
 
 @spec("4.6", "A.5", finding="F5")
@@ -193,8 +193,8 @@ def test_a_resolver_not_executed_re_entry_happens_once():
     sc.systems["fulfilment"].fail_next = "indeterminate"
     run = sc.start()
     sc.execute(run)
-    sc.platform.run.record_outcome(run, "n4", "not_executed", "evidence:q")
-    sc.platform.run.resolver_resume(run, "oncall-resolver")
+    sc.platform.ops.record_outcome(run, "n4", "not_executed", "evidence:q")
+    sc.platform.ops.resolver_resume(run)
     sc.execute(run)
     assert run.state == "COMPLETED" and len(sc.systems["fulfilment"].shipments) == 1
     assert not run.not_executed
