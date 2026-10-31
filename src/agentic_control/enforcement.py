@@ -243,6 +243,15 @@ class EnforcementPoint:
         except Exception:
             return "p:" + digest(obj)
 
+    def _params_of(self, decision_event: dict[str, Any]) -> dict[str, Any]:
+        """Parameters are never inline in an event; they are read back through their reference, and an
+        erased payload yields nothing (a compensation over it then fails to verify)."""
+        try:
+            p = self.evs.payloads.get(decision_event["parameters_ref"])
+        except KeyError:
+            return {}
+        return dict(p) if isinstance(p, dict) else {}
+
     # ------------------------------------------------------------------ per-call duties
     def _accepted(self, run: Run) -> set[str]:
         """Values a qualifying sanitizer accepted in this run. A replacement PEP has no local record and
@@ -366,13 +375,15 @@ class EnforcementPoint:
     def _decision_event(self, run: Run, node: Node, rq: DecisionRequest, d: Decision, reservation: str | None,
                         counters: dict[str, int], idem: str | None, approval_ref: str | None) -> str:
         ev = {"type": "decision", "node_id": node.id, "purpose": rq.purpose, "tool": rq.tool.tool_id, "version": rq.tool.version,
-              "schema_hash": rq.tool.schema_hash, "parameters_ref": self._payload(rq.parameters), "parameters": rq.parameters,
+              "schema_hash": rq.tool.schema_hash, "parameters_ref": self._payload(rq.parameters),
               "parameter_roles": rq.tool.parameter_roles, "action_hash": rq.action_hash, "factors": sorted(rq.factors),
               "tier": node.tier, "decision": d.result, "rule_id": d.rule_id, "reason": d.reason, "obligations": d.obligations,
               "stop_list_seq": rq.stop_list_seq, "provenance": rq.provenance}
         if reservation:
             ev["reservation_id"] = reservation; ev["counters_snapshot"] = counters
-            ev["reservation_keys"] = self._keys(run, rq.tool, rq.parameters)
+            ev["reservation_keys_ref"] = self._payload(self._keys(run, rq.tool, rq.parameters))   # erasable: carries the destination
+        elif rq.purpose == "normal" and node.type == "effect":
+            ev["reservation"] = "local"; ev["counters_snapshot"] = counters
         if idem:
             ev["idempotency_key"] = idem
         if approval_ref:
@@ -962,7 +973,7 @@ class EnforcementPoint:
             for r in run.effects:
                 if r.node_id == node_id:
                     result = r.result_fields
-            return {"verified": self.evs.event_verifies(dec["event_id"]), "parameters": dec.get("parameters", {}), "result": result or {},
+            return {"verified": self.evs.event_verifies(dec["event_id"]), "parameters": self._params_of(dec), "result": result or {},
                     "decision": dec["decision"], "action_hash": dec["action_hash"], "idempotency_key": dec.get("idempotency_key"),
                     "effect_events": [e["type"] for e in effects], "later_hold_outcomes": [h["outcome"] for h in holds]}
         copy = self.run.signed_effect_copy(run, node_id)
@@ -973,7 +984,7 @@ class EnforcementPoint:
         if self.journal:
             for e in self.journal.events():
                 if e["type"] == "decision" and e["node_id"] == node_id and e.get("run_id") == run.run_id:
-                    return {"verified": self.journal.entry_verifies(e["event_id"], self.trust), "parameters": e.get("parameters", {}), "result": {},
+                    return {"verified": self.journal.entry_verifies(e["event_id"], self.trust), "parameters": self._params_of(e), "result": {},
                             "decision": e["decision"], "action_hash": e["action_hash"], "idempotency_key": e.get("idempotency_key"),
                             "effect_events": [x["type"] for x in self.journal.events() if x["type"].startswith("effect.") and x.get("action_hash") == e["action_hash"]],
                             "later_hold_outcomes": []}
@@ -997,8 +1008,11 @@ class EnforcementPoint:
         presentation = self.registry.systems[rev.target_system].presentation
         try:
             cred = self._credential(run, cnode, rev, "compensation", original["action_hash"])
+        except (Refused, Unavailable) as e:
+            return {"status": "not_attempted", "reason": str(e)}      # nothing was sent, nothing is recorded
+        try:
             res = self.systems[rev.target_system].execute(rev.tool_id, params, cred, self.workload, "compensation", original["action_hash"])
-        except (SystemRefused, Refused, Unavailable) as e:
+        except SystemRefused as e:
             self._write(run, {"type": "effect.failed", "node_id": cnode.id, "purpose": "compensation", "credential_presentation": presentation,
                               "error": "system_error", "recorded_by": "pep", "action_hash": original["action_hash"]})
             return {"status": "failed", "reason": str(e)}

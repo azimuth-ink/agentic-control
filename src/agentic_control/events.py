@@ -69,6 +69,9 @@ def validate(event: dict[str, Any]) -> None:
         hdr = RUN_HEADER - set(event)
         if hdr:
             raise SchemaError(f"{t}: missing run header {sorted(hdr)}")
+    if t == "decision" and event.get("purpose") == "normal" and event.get("tier") is not None:
+        if "reservation_id" not in event and event.get("reservation") != "local":
+            raise SchemaError("decision: a normal effect decision carries its reservation (or 'local' under a RUN outage)")
     if t == "run.resumed" and event["cause"] not in RESUME_CAUSES:
         raise SchemaError("run.resumed: unknown cause")
     if t == "hold.resolved" and event["outcome"] not in HOLD_OUTCOMES:

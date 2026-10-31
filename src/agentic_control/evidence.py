@@ -8,20 +8,30 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from . import events as schema
-from .common import Availability, Clock, canonical_json, digest, new_id, sha256_hex
+import hmac
+import secrets
+
+from .common import Availability, Clock, canonical_json, new_id, sha256_hex
 from .crypto import Signer, TrustStore
 
 
 class PayloadStore:
-    """Separable, erasable payloads referenced by keyed hash (A.6)."""
+    """Separable, erasable payloads referenced by keyed hash (A.6). The reference is an HMAC over the
+    canonical payload under a store key, so a low-entropy payload cannot be recovered from its reference
+    after erasure."""
 
     def __init__(self) -> None:
         self._items: dict[str, Any] = {}
         self.erased: set[str] = set()
+        self.key = secrets.token_bytes(32)
+
+    def ref_for(self, payload: Any) -> str:
+        return "p:" + hmac.new(self.key, canonical_json(payload), "sha256").hexdigest()
 
     def put(self, payload: Any) -> str:
-        ref = "p:" + digest(payload)
-        self._items[ref] = payload
+        ref = self.ref_for(payload)
+        if ref not in self.erased:
+            self._items[ref] = payload
         return ref
 
     def get(self, ref: str) -> Any:
@@ -101,7 +111,7 @@ class EvidenceStore(Availability):
     def reconcile(self, journal: "Journal", trust: TrustStore) -> int:
         """Journals reconcile into EVS in order with a journal.reconciled event naming the gap."""
         self._check()
-        entries = journal.drain(trust)
+        entries = journal.verified_entries(trust)        # nothing leaves the journal until it is in the chain
         for e in entries:
             e = dict(e)
             e.pop("prev_hash", None); e.pop("hash", None)
@@ -110,6 +120,7 @@ class EvidenceStore(Availability):
             self.append({"type": "journal.reconciled", "scope": journal.workload,
                          "gap_start": entries[0].get("timestamp"), "gap_end": entries[-1].get("timestamp"),
                          "events_count": len(entries), "counters_merged": journal.counters_merged()})
+        journal.clear(len(entries))
         return len(entries)
 
     def import_external(self, source: str, record: dict[str, Any], expected_fields: list[str]) -> str:
@@ -148,12 +159,20 @@ class Journal:
     def events(self) -> list[dict[str, Any]]:
         return [e["payload"] for e in self.entries]
 
-    def drain(self, trust: TrustStore) -> list[dict[str, Any]]:
+    def verified_entries(self, trust: TrustStore) -> list[dict[str, Any]]:
+        """Every entry must verify under the workload role and under this journal's own key."""
         out = []
         for e in self.entries:
-            if not trust.verify(e, role="workload"):
+            if e.get("key_id") != self.signer.key_id or not trust.verify(e, role="workload"):
                 raise ValueError("journal entry signature invalid")
             out.append(e["payload"])
+        return out
+
+    def clear(self, n: int) -> None:
+        self.entries = self.entries[n:]
+
+    def drain(self, trust: TrustStore) -> list[dict[str, Any]]:
+        out = self.verified_entries(trust)
         self.entries = []
         return out
 

@@ -256,3 +256,117 @@ def test_the_denied_shipment_routes_to_a_person_and_the_record_tag_follows_the_w
     sc2.execute(run2)
     tags = sc2.systems["fulfilment"].records["dev-1"]["_tags"]
     assert tags["replacement_issued"] == "exposed" and tags["ship_address"] == "verified"
+
+
+@spec("A.2", "A.6", finding="F7")
+def test_erasing_a_payload_removes_personal_data_and_leaves_the_chain_standing():
+    """Review-2 item 3: parameters are never inline; references are keyed hashes."""
+    sc = build_scenario(trigger="clean-ticket")
+    run = sc.start()
+    sc.execute(run)
+    evs = sc.platform.evs
+    dec = last_decision(sc, run, "n4")
+    assert "parameters" not in dec and "reservation_keys" not in dec
+    refs = [dec["parameters_ref"], dec["reservation_keys_ref"]]
+    assert evs.payloads.get(refs[1])["destination"] == "12 Main St"
+    evs.erase(run.run_id, refs, "data-protection")
+    for r in refs:
+        with pytest.raises(KeyError):
+            evs.payloads.get(r)
+    assert evs.verify() and evs.events[-1]["type"] == "erasure.applied"
+    # the reference is an HMAC, not a plain hash of a guessable payload
+    from agentic_control.common import digest
+    assert dec["parameters_ref"] != "p:" + digest({"device_id": "dev-1", "part_sku": "PART-100", "amount": 120.0, "destination": "12 Main St"})
+    # the event stands: a compensation whose mapping references only the recorded result still verifies and runs
+    res = sc.platform.run.instruct_compensation(run, "n4")
+    assert res["status"] == "executed"
+
+
+@spec("A.1", "4.2", "4.3", finding="F8")
+def test_linter_clauses_added_after_the_second_review():
+    """Review-2 item 7."""
+    from agentic_control.release import Bound, Node, Release
+    sc = build_scenario(trigger="clean-ticket")
+    reg, pol = sc.platform.registry, sc.platform.policy
+    rel = sc.release
+
+    def errs():
+        return reg.lint_release(rel, pol, {"pep-1.0"})
+    assert errs() == []
+    n2 = rel.node("n2"); n2.token_cap = None
+    assert any("step cap and a token cap" in e for e in errs()); n2.token_cap = 200
+    n4 = rel.node("n4"); n4.tools = ["send_reply"]
+    assert any("exactly one tool" in e for e in errs()); n4.tools = []
+    c1 = rel.node("c1"); c1.tool = "delete_note"
+    assert any("reversing tool" in e for e in errs()); c1.tool = "cancel_shipment"
+    c1.reverses = "n1"
+    assert any("must name an effect node" in e for e in errs()); c1.reverses = "n4"
+    n4.bounds.append(Bound("anchor_rel", param="device_id", rel=None, anchor="subject"))
+    assert any("names no relation" in e for e in errs()); n4.bounds.pop()
+    n4.bounds.append(Bound("eq_rel_anchor", param="destination", rel="address_on_file", anchor="nobody"))
+    assert any("unknown anchor" in e for e in errs()); n4.bounds.pop()
+    assert errs() == []
+    # the p == acting_user output form anchors a recipient
+    from agentic_control.release import anchored_params
+    assert anchored_params([Bound("eq_anchor", param="recipient", anchor="acting_user")], set()) == {"recipient"}
+    assert anchored_params([Bound("anchor_rel", param="x", rel=None, anchor="subject")], set()) == set()
+    # a handoff names agent:<target>
+    h = Node("h9", "handoff", tool="agent:other", target_agent="triage-agent")
+    bad = Release(AGENT, "9", "S2", "sidecar", "pep-1.0", [h], tools={}, scopes={})
+    assert any("agent:<target_agent>" in e for e in reg.lint_release(bad, pol, {"pep-1.0"}))
+
+
+@spec("A.1", finding="F8")
+def test_stores_are_never_the_target_of_a_side_effect_tool_and_a_new_source_can_be_refused():
+    from agentic_control.registry import SystemCapability, ToolManifest
+    sc = build_scenario(trigger="clean-ticket")
+    reg = sc.platform.registry
+    with pytest.raises(Refused, match="never the target"):
+        reg.register_tool(ToolManifest("purge_log", "1", "case_log", {"sink": "string"}, side_effect_class="reversible_internal",
+                                       parameter_roles={"sink": "resource"}))
+    # a brand-new registration that would remove anchor capability from a published release is refused, not applied
+    with pytest.raises(Refused, match="remove anchor capability"):
+        reg.register_system(SystemCapability("fulfilment", "system_of_record", provenance_tag=True, presentation="per_agent",
+                                             preview_tool="preview_shipment", idempotency=True, verified_fields=set(),
+                                             pip_relations=reg.systems["fulfilment"].pip_relations))
+    assert reg.systems["fulfilment"].verified_fields == {"ship_address"} and not sc.release.suspended
+
+
+@spec("D", "A.2", finding="F6")
+def test_evidence_details_from_the_second_review():
+    """Review-2 item 9: inputs_ref carries the run's recorded inputs and taint; normal effect decisions carry
+    a reservation; the journal is cleared only after its entries are chained; memory writes carry no factor."""
+    from agentic_control import events as schema
+    from agentic_control.registry import ToolManifest
+    sc = build_scenario()
+    run = sc.start()
+    sc.execute(run)
+    evs = sc.platform.evs
+    entered = events(sc, run, "node.entered", "n4")[0]
+    inputs = evs.payloads.get(entered["inputs_ref"])
+    assert inputs["exposed"] is True and "n3" in inputs["outputs"] and inputs["tainted_reads"]
+    hdr = {"trace_id": "t", "run_id": "r", "agent_id": "a", "release_version": "1", "surface": "S2"}
+    bad = {"type": "decision", **hdr, "node_id": "n", "purpose": "normal", "tool": "t", "version": "1", "schema_hash": "h",
+           "parameters_ref": "p", "parameter_roles": {}, "action_hash": "a", "factors": [], "decision": "ALLOW", "rule_id": "allow",
+           "obligations": [], "stop_list_seq": 1, "tier": "A2"}
+    with pytest.raises(schema.SchemaError, match="reservation"):
+        schema.validate(bad)
+    schema.validate({**bad, "reservation": "local"})
+    reg = sc.platform.registry
+    m = ToolManifest("remember", "1", "agent_memory", {"key": "string", "value": "string"}, writes_fields=[("agent_memory", "value")],
+                     parameter_roles={"key": "resource"})
+    m.side_effect_class = "internal_store"
+    assert reg.derive_factors(m, {"key": "k", "value": "v"}) == set()
+    # the journal keeps its entries until the chain has them
+    from agentic_control.common import Unavailable
+    sc2 = build_scenario(trigger="clean-ticket", internal_effect=True)
+    run2 = sc2.start()
+    sc2.platform.outage("EVS")
+    sc2.execute(run2)
+    n = len(sc2.pep.journal.entries)
+    assert n > 0
+    with pytest.raises(Unavailable):
+        sc2.platform.evs.reconcile(sc2.pep.journal, sc2.platform.trust)       # still down: nothing drained
+    assert len(sc2.pep.journal.entries) == n
+    sc2.platform.outage("EVS", down=False)
+    assert sc2.platform.evs.reconcile(sc2.pep.journal, sc2.platform.trust) == n and not sc2.pep.journal.entries

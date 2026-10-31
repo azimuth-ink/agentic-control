@@ -15,7 +15,8 @@ from typing import Any, Callable
 
 from .common import Clock, Availability, Record, Refused, digest
 from .crypto import PublicKey
-from .release import (DERIVED_CLASSES, MATRIX, NODE_TYPES, SIDE_EFFECT_CLASSES, Node, Release, anchored_params)
+from .release import (ANCHORS, DERIVED_CLASSES, EFFECT_CLASSES, MATRIX, NODE_TYPES, SIDE_EFFECT_CLASSES, Node, Release,
+                      anchored_params)
 
 SYSTEM_KINDS = {"system_of_record", "sink_store", "interface", "derived_store", "memory"}
 DBS_KINDS = {"sink_store", "interface", "derived_store", "memory"}
@@ -223,8 +224,7 @@ class Registry(Availability):
         for other in self.systems.values():
             if other.system_id != cap.system_id and (other.endpoint or other.system_id) == ep:
                 raise Refused(f"endpoint {ep} is already registered as {other.system_id}; one system is registered once, under one kind")
-        if cap.system_id in self.systems:
-            self._refuse_if_breaks_anchors(lambda: self._with_system(cap))
+        self._refuse_if_breaks_anchors(lambda: self._with_system(cap))   # new or replaced: a change REG can refuse
         self.systems[cap.system_id] = cap
         self._recompute_anchor_capability()
         return cap
@@ -251,6 +251,8 @@ class Registry(Availability):
             m.side_effect_class = derived
         elif m.side_effect_class in DERIVED_CLASSES:
             raise Refused(f"class {m.side_effect_class} cannot be authored")
+        if target is not None and target.kind in {"memory", "sink_store"} and m.side_effect_class in EFFECT_CLASSES:
+            raise Refused(f"a {target.kind} is never the target of a side-effect tool (A.1)")
         if m.side_effect_class == "none":
             if m.is_writing_tool and target is not None and target.kind in {"system_of_record", "derived_store"}:
                 raise Refused("a writing tool whose target is a system_of_record or derived_store must carry an effect class")
@@ -456,7 +458,7 @@ class Registry(Availability):
     def static_factors(self, m: ToolManifest) -> set[str]:
         """Factors knowable from the manifest alone (the linter's view)."""
         f: set[str] = set()
-        if m.compensation == "irreversible" and m.side_effect_class != "none":
+        if m.compensation == "irreversible" and m.side_effect_class in EFFECT_CLASSES:
             f.add("irreversible")
         if m.side_effect_class in {"external", "financial_legal"}:
             f.add("external")
@@ -474,7 +476,7 @@ class Registry(Availability):
     def derive_factors(self, m: ToolManifest, params: dict[str, Any]) -> set[str]:
         """Factor derivation per call (A.1): irreversible, external, regulated, sensitive."""
         f: set[str] = set()
-        if m.compensation == "irreversible" and m.side_effect_class != "none":
+        if m.compensation == "irreversible" and m.side_effect_class in EFFECT_CLASSES:
             f.add("irreversible")
         if m.side_effect_class in {"external", "financial_legal"}:
             f.add("external")
@@ -564,6 +566,17 @@ class Registry(Availability):
                 # resumption path
                 if n.tier in {"A1", "A2"} and not self._has_resumption_path(n, policy):
                     errs.append(f"{n.id}: no resumption path (grant or substitution) under the current policy bundle")
+            if n.type == "loop" and (n.step_cap is None or n.token_cap is None):
+                errs.append(f"{n.id}: a loop node declares a step cap and a token cap (4.2, D2)")
+            if n.type in {"effect", "output", "compensate"} and n.tools:
+                errs.append(f"{n.id}: a {n.type} node names exactly one tool")
+            if n.type in {"handoff", "service"} and n.tool != f"agent:{n.target_agent}":
+                errs.append(f"{n.id}: a {n.type} node's tool is agent:<target_agent>")
+            for b in n.bounds:
+                if b.form in {"anchor_rel", "eq_rel_anchor", "eq_rel_param"} and not b.rel:
+                    errs.append(f"{n.id}: bound on {b.param} names no relation")
+                if b.form in {"anchor_rel", "eq_rel_anchor", "eq_anchor"} and b.anchor not in ANCHORS | scope_names:
+                    errs.append(f"{n.id}: bound on {b.param} anchors to an unknown anchor {b.anchor}")
             if n.type in {"read", "loop"}:
                 anchored = anchored_params(n.bounds, scope_names)
                 for tid in n.declared_tools():
@@ -578,12 +591,21 @@ class Registry(Availability):
                     target = self.systems[m.target_system]
                     anchored = anchored_params(n.bounds, scope_names)
                     if target.kind == "interface" and "recipient" not in anchored:
-                        errs.append(f"{n.id}: output to an interface must bound its recipient")
+                        errs.append(f"{n.id}: output to an interface must bound its recipient (recipient in release.recipients, or recipient == acting_user)")
                     if target.kind == "sink_store" and "sink" not in anchored:
                         errs.append(f"{n.id}: output to a sink store must bound its sink")
             if n.type == "compensate":
                 if n.reverses is None:
                     errs.append(f"{n.id}: compensate node must name the effect node it reverses")
+                else:
+                    rv = next((x for x in rel.nodes if x.id == n.reverses), None)
+                    rm = self.tools.get(rv.tool or "") if rv else None
+                    if rv is None or rv.type != "effect":
+                        errs.append(f"{n.id}: reverses must name an effect node")
+                    elif rm is not None:
+                        mapping = rm.compensation if isinstance(rm.compensation, dict) else None
+                        if mapping is None or mapping.get("reversing_tool") != n.tool:
+                            errs.append(f"{n.id}: tool must be the reversing tool the manifest of {rv.tool} maps")
             if n.type == "sanitize" and (n.sanitizer is None or n.sanitizer not in self.sanitizers):
                 errs.append(f"{n.id}: sanitize node must name a registered sanitizer")
         for b_rel in self._release_anchors(rel):

@@ -20,7 +20,8 @@ def test_compensation_parameters_come_only_from_the_recorded_call():
     res = sc.platform.run.instruct_compensation(run, "n4")
     assert res["status"] == "executed"
     dec = last_decision(sc, run, "c1", "compensation")
-    assert dec["decision"] == "ALLOW" and dec["parameters"] == {"shipment_id": "ship-1"}
+    assert dec["decision"] == "ALLOW" and sc.platform.evs.payloads.get(dec["parameters_ref"]) == {"shipment_id": "ship-1"}
+    assert "parameters" not in dec                                   # parameters live in the erasable payload store
     assert dec["action_hash"] != last_decision(sc, run, "n4")["action_hash"]   # its own hash, over the reversing tool
     ex = events(sc, run, "effect.executed", "c1")[-1]
     assert ex["purpose"] == "compensation" and ex["action_hash"] == last_decision(sc, run, "n4")["action_hash"]
@@ -52,7 +53,7 @@ def test_a_compensation_against_an_original_that_does_not_verify_is_denied():
     dec = last_decision(sc, run, "n4")
     for e in evs.events:
         if e["event_id"] == dec["event_id"]:
-            e["parameters"] = {**e["parameters"], "amount": 1.0}        # tamper with the chained event
+            e["parameters_ref"] = evs.payloads.put({"device_id": "dev-1", "amount": 1.0})   # tamper with the chained event
     assert not evs.event_verifies(dec["event_id"])
     res = sc.platform.run.instruct_compensation(run, "n4")
     assert res["status"] == "denied" and "verify" in res["reason"]
