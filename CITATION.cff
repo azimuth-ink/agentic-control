@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this reference implementation or the specification it implements, please cite it as below."
+title: "agentic-control: reference implementation of the Agentic Control Architecture"
+type: software
+authors:
+  - family-names: Gray
+    given-names: Jeff
+    orcid: "https://orcid.org/0009-0005-6796-6576"
+    affiliation: Independent
+version: 0.1.0
+date-released: 2026-10-31
+license: Apache-2.0
+repository-code: "https://github.com/azimuth-ink/agentic-control"
+url: "https://azimuth.ink"
+keywords:
+  - LLM agents
+  - agent governance
+  - policy enforcement
+  - delegated authority
+  - evidence
+  - control plane
+  - reference architecture
+  - conformance
