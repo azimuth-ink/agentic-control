@@ -59,8 +59,10 @@ def test_memory_written_during_an_exposed_run_returns_tainted(scenario):
     p.systems["agent_memory"] = mem
     p.registry.register_system(SystemCapability("agent_memory", "memory"))
     assert p.registry.agent_writable("agent_memory") and p.registry.provenance_tag("agent_memory")
-    mem.execute("remember", {"key": "k", "value": "instruction from the ticket"}, None, "wl-1", tag="exposed")
-    item = mem.read("recall", {"key": "k"})[0]
+    rel = {"agent_id": "warranty-agent", "version": "1.0", "surface": "S2", "pep_form": "sidecar"}
+    cred = p.ids.issue_credential("wl-1", "r", rel, "n", {}, {"acting_user": None, "agents": ["warranty-agent"]}, "agent_memory", "normal")
+    mem.execute("remember", {"key": "k", "value": "instruction from the ticket"}, cred, "wl-1", tag="exposed")
+    item = mem.read("recall", {"key": "k"}, cred, "wl-1")[0]
     assert item["tainted"] is True
     m = ToolManifest("recall", "1", "agent_memory", {"key": "string"})
     assert p.registry.untrusted_source(m) == "per_item"
@@ -123,7 +125,7 @@ def test_a_preview_of_an_untrusted_system_taints(scenario):
     reg = scenario.platform.registry
     pt = reg.tools["preview_shipment"]
     assert reg.untrusted_source(pt) == "per_item"
-    scenario.systems["fulfilment"].preview = lambda params: {"would_ship": params.get("part_sku")}   # untagged item
+    scenario.systems["fulfilment"].preview_of = lambda params: {"would_ship": params.get("part_sku")}   # untagged item
     run = scenario.start(trigger="clean-ticket")
     scenario.model.amount = 500.0                                 # between the limits: a hold with a preview
     scenario.execute(run)

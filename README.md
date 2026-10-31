@@ -38,7 +38,7 @@ Everything runs in one process with injected time. There is no network, no datab
 
 ```
 pip install -e ".[dev]"
-pytest                                    # 132 tests
+pytest                                    # 146 tests
 python tools/conformance_report.py        # which clauses and findings are covered
 ```
 
@@ -90,7 +90,7 @@ sc.platform.ops.approve(run, "n4", "approver-1")   # grant redeemed, same action
 
 ## What the suite found
 
-Writing the conformance tests against the first cut of the code surfaced defects that a reading of the specification alone had not: a replacement PEP recomputed provenance from a local set that no longer existed (now rebuilt from `sanitize.result` evidence); the host-lost timer kept running through a hold; an approval during an IDS outage raised instead of being recorded; degraded-mode effects were counted twice; the compensation mapping was looked up on the reversing tool rather than the reversed effect's manifest; a run started under a current stop ran its reads and completed on denial branches rather than being refused; an IDS refusal propagated out of the PEP as an exception rather than a recorded failure. `CHANGELOG.md` has the list. The point of recording them here is that the specification's verification record is about the text; this is the first record about an implementation of it.
+Writing the conformance tests against the first cut of the code surfaced defects that a reading of the specification alone had not: a replacement PEP recomputed provenance from a local set that no longer existed (now rebuilt from `sanitize.result` evidence); the host-lost timer kept running through a hold; an approval during an IDS outage raised instead of being recorded; degraded-mode effects were counted twice; the compensation mapping was looked up on the reversing tool rather than the reversed effect's manifest; a run started under a current stop ran its reads and completed on denial branches rather than being refused; an IDS refusal propagated out of the PEP as an exception rather than a recorded failure. An independent review of the first cut against the text then found a second set: factored and exposed effects continuing through EVS and RUN outages, reads and deliveries presenting no credential, a replay failure erasing doubt, `deny` without `approve`'s guards, a skippable `human` node. `CHANGELOG.md` has both lists and `tests/conformance/test_review_fixes.py` pins the second. The point of recording them here is that the specification's verification record is about the text; this is the first record about an implementation of it.
 
 ## What this is not
 

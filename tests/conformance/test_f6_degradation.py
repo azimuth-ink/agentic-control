@@ -18,13 +18,19 @@ def outage_at(node_id, sc, component):
 
 
 @spec("6.1", "A.2", "A.4", finding="F6")
-def test_evs_outage_journals_and_reconciles_in_order():
-    sc = build_scenario(trigger="clean-ticket")
+def test_evs_outage_no_factor_effects_and_reads_continue_journaled_other_effects_park():
+    sc = build_scenario(trigger="clean-ticket", internal_effect=True)
     run = sc.start()
-    outage_at("n3", sc, "EVS")
+    outage_at("n0", sc, "EVS")
     sc.execute(run)
-    assert run.state == "COMPLETED"
-    assert sc.pep.journal.entries and sc.pep.degraded_calls > 0
+    # the note (no factor, run neither exposed nor delegated) was made and journaled; the reads continued;
+    # the shipment's destination resolves outside (factor external): the run parks at it
+    assert run.state == "PARKED" and run.park["reason"] == "EVS unavailable"
+    assert sc.systems["notes"].records and not sc.systems["fulfilment"].shipments
+    j = sc.pep.journal.events()
+    assert [e["type"] for e in j if e["type"] in {"decision", "effect.executed"} and e.get("node_id") == "n0"] == ["decision", "effect.executed"]
+    assert any(e["type"] == "node.exited" and e["node_id"] == "n3" for e in j)
+    assert sc.pep.degraded_calls > 0
     before = len(sc.platform.evs.events)
     sc.platform.outage("EVS", down=False)
     n = sc.platform.evs.reconcile(sc.pep.journal, sc.platform.trust)
@@ -33,9 +39,26 @@ def test_evs_outage_journals_and_reconciles_in_order():
     assert evs.verify()
     rec = [e for e in evs.events if e["type"] == "journal.reconciled"][-1]
     assert rec["events_count"] == n and rec["scope"] == "wl-1"
-    types = [e["type"] for e in evs.read_unchecked(run.run_id)]
-    assert types.index("decision") < types.index("effect.executed") < types.index("run.completed")
+    types = [(e["type"], e.get("node_id")) for e in evs.read_unchecked(run.run_id)]
+    assert types.index(("decision", "n0")) < types.index(("effect.executed", "n0")) < types.index(("node.exited", "n0"))
     assert len(evs.events) == before + n + 1
+    assert sc.platform.run.recover(run) == "RUNNING"
+    sc.execute(run)
+    assert run.state == "COMPLETED" and len(sc.systems["fulfilment"].shipments) == 1
+
+
+@spec("6.1", "6.2", "A.4", finding="F6")
+def test_evs_outage_an_exposed_or_delegated_run_makes_no_effect():
+    sc = build_scenario(internal_effect=True)                     # untrusted ticket: exposed at start
+    run = sc.start()
+    sc.platform.outage("EVS")
+    sc.execute(run)
+    assert run.state == "PARKED" and not sc.systems["notes"].records
+    sc2 = build_scenario(internal_effect=True, trigger="console")  # delegated: an acting user
+    run2 = sc2.start(user="advisor-1")
+    sc2.platform.outage("EVS")
+    sc2.execute(run2)
+    assert run2.state == "PARKED" and not sc2.systems["notes"].records
 
 
 @spec("6.1", "A.2", finding="F6")

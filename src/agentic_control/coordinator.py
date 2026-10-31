@@ -103,6 +103,7 @@ class Run:
     disposition: str | None = None
     held_before_park: bool = False
     in_doubt_cache: set[str] = field(default_factory=set)
+    deferred_branch: tuple[str, str] | None = None     # a denial recorded while PARKED, applied on recovery
     unreconciled_journal: bool = False
     workload: str | None = None
 
@@ -249,10 +250,14 @@ class RunCoordinator(Availability):
             return False
         if node_id not in run.entered:
             run.entered.append(node_id)
+        run.not_executed.discard(node_id)          # a re-entry after a resolver's not_executed happens once
+        run.cancelled_effects.discard(node_id)
         if node_type == "effect":
             run.effect_node_entered = True
         run.last_heartbeat = self.clock.now()
         self._ev(run, {"type": "node.hook", "node_id": node_id, "node_type": node_type, "inputs_ref": inputs_ref})
+        if node_type == "human":
+            self.input_hold(run, run.release.node(node_id))   # node entry has one source; RUN opens the input hold
         return True
 
     def _branch_targets(self, run: Run) -> set[str]:
@@ -271,6 +276,8 @@ class RunCoordinator(Availability):
     def checkpoint(self, run: Run, node_id: str, outputs: Any, run_state: dict[str, Any], branch: str | None = None) -> None:
         """At every node boundary RUN persists node outputs, run state, and the next node."""
         self._check()
+        if node_id not in run.entered:
+            raise Denied(f"checkpoint for {node_id} without its node_entered hook")
         run.outputs[node_id] = outputs
         run.exited.add(node_id)
         run.in_doubt_cache.discard(node_id)
@@ -448,7 +455,7 @@ class RunCoordinator(Availability):
             try:
                 res = pep.instruct(run, node.id, "preview", parameters=pending["parameters"])
                 h.preview_ref = res.get("result_ref")
-            except Denied:
+            except (Denied, Unavailable, Refused):
                 h.preview_ref = None
         view = {"tool": pending["tool"], "parameters": pending["parameters"], "preview": h.preview_ref or "none exists",
                 "subject": run.subject, "factors": sorted(pending.get("factors", [])), "bounds": [b.to_dict() for b in node.bounds],
@@ -502,7 +509,7 @@ class RunCoordinator(Availability):
         marks it grant or substitution, and instructs the PEP to resume."""
         self._check()
         h = run.holds[node_id]
-        if h.status != "open" or run.state != "HELD":
+        if h.status != "open" or run.state not in {"HELD", "PARKED"}:
             raise Refused("no open hold")
         if approver not in h.approver_set:
             raise Refused("approver not in the approver set")
@@ -552,18 +559,30 @@ class RunCoordinator(Availability):
                 return {"status": "approved_while_parked"}
         return {"status": "approved_while_parked"}
 
-    def _deny_hold(self, run: Run, h: Hold, outcome: str) -> dict[str, Any]:
+    def _deny_hold(self, run: Run, h: Hold, outcome: str, approver: str | None = None) -> dict[str, Any]:
         h.status = "resolved"
         self._invalidate_grant(run, h)
-        self._ev(run, {"type": "hold.resolved", "node_id": h.node_id, "outcome": outcome, "approvers": [], "substitution": False})
-        self._pep(run).release_pending(run, h.node_id)
+        self._ev(run, {"type": "hold.resolved", "node_id": h.node_id, "outcome": outcome,
+                       "approvers": [approver] if approver else [], "substitution": False})
+        try:
+            self._pep(run).release_pending(run, h.node_id)
+        except Denied:
+            pass
+        if run.state == "PARKED":
+            run.deferred_branch = (h.node_id, "denial")      # applied when the run leaves PARKED
+            return {"status": f"{outcome}_while_parked"}
         self._transition(run, "RUNNING", "run.resumed", cause="denial_branch")
         self._follow_branch(run, h.node_id, "denial")
         return {"status": outcome}
 
     def deny(self, run: Run, node_id: str, approver: str) -> dict[str, Any]:
         self._check()
-        return self._deny_hold(run, run.holds[node_id], "denied")
+        h = run.holds.get(node_id)
+        if h is None or h.status != "open" or run.state not in {"HELD", "PARKED"}:
+            raise Refused("no open hold")
+        if approver not in h.approver_set:
+            raise Refused("approver not in the approver set")
+        return self._deny_hold(run, h, "denied", approver)
 
     def _invalidate_grant(self, run: Run, h: Hold) -> None:
         if h.grant_id:
@@ -628,7 +647,8 @@ class RunCoordinator(Availability):
         if not decisions or decisions[-1]["decision"] != "ALLOW":
             return False
         ah = decisions[-1]["action_hash"]
-        effects = [e for e in evs if e["type"].startswith("effect.") and e.get("action_hash") == ah]
+        effects = [e for e in evs if e["type"].startswith("effect.") and e.get("action_hash") == ah
+                   and not (e["type"] == "effect.failed" and e.get("purpose") == "replay")]
         return not effects or effects[-1]["type"] == "effect.indeterminate"
 
     def resolve_in_doubt(self, run: Run, node_id: str) -> str:
@@ -636,17 +656,28 @@ class RunCoordinator(Availability):
         node = run.release.node(node_id)
         sysc = self.registry.systems[self.registry.tools[node.tool].target_system]
         run.in_doubt_cache.add(node_id)
-        attempts = run.replay_attempts.get(node_id, 0)
-        if sysc.idempotency and attempts < self.policy.consecutive_replays:
-            run.replay_attempts[node_id] = attempts + 1
+        while sysc.idempotency and run.replay_attempts.get(node_id, 0) < self.policy.consecutive_replays:
+            run.replay_attempts[node_id] = run.replay_attempts.get(node_id, 0) + 1
             res = self._pep(run).instruct(run, node_id, "replay")
-            if res.get("status") == "executed":
+            status = res.get("status")
+            if status == "executed":
                 self._node_resolved_executed(run, node_id, res.get("outputs"))
                 return "replayed"
-            if res.get("status") == "denied":
+            if status == "denied":
                 self._park(run, "replay denied", recoverable=False)
                 return "parked"
-            return "indeterminate"
+            if status == "failed":
+                self._park(run, "replay refused by the system; effect in doubt needs a resolver", recoverable=False)
+                return "parked"
+            if status == "not_attempted":
+                break                     # no credential: nothing was sent; park recoverably, retry on recovery
+            # indeterminate again: try the next replay within the count
+        if run.state == "PARKED":
+            return "parked"
+        if res.get("status") == "not_attempted" if sysc.idempotency and run.replay_attempts.get(node_id, 0) else False:
+            run.replay_attempts[node_id] -= 1
+            self._park(run, "replay needs a credential", recoverable=True)
+            return "parked"
         self._park(run, "effect in doubt needs a resolver", recoverable=False)
         return "parked"
 
@@ -721,9 +752,16 @@ class RunCoordinator(Availability):
         for nid in list(run.entered):
             if self.in_doubt(run, nid):
                 r = self.resolve_in_doubt(run, nid)
-                if r == "parked":
+                if r != "replayed":
                     return run.state
         self._end_suspension(run)
+        if run.deferred_branch:
+            nid, kind = run.deferred_branch
+            run.deferred_branch = None
+            run.park = None
+            self._transition(run, "RUNNING", "run.resumed", cause="denial_branch")
+            self._follow_branch(run, nid, kind)
+            return run.state
         if run.held_before_park:
             h = next((x for x in run.holds.values() if x.status in {"open", "approved"}), None)
             if h and h.status == "approved":
@@ -760,17 +798,25 @@ class RunCoordinator(Availability):
                 h.suspensions.append([h.timers_suspended_since, end])
                 h.timers_suspended_since = None
 
-    def _suspended_total(self, h: Hold) -> float:
-        total = sum(e - s for s, e in h.suspensions)
+    def _suspended_total(self, h: Hold, since: float | None = None) -> float:
+        """Suspended time credited to a timer, clipped to intervals after `since` and capped at max_park."""
+        now = self.clock.now()
+        intervals = [list(x) for x in h.suspensions]
         if h.timers_suspended_since is not None:
-            total += min(self.clock.now() - h.timers_suspended_since, self.policy.max_park)
+            intervals.append([h.timers_suspended_since, now])
+        total = 0.0
+        for s, e in intervals:
+            if since is not None:
+                s = max(s, since)
+            if e > s:
+                total += e - s
         return min(total, self.policy.max_park)
 
     def _approval_timed_out(self, h: Hold) -> bool:
-        return h.approval_time is None and self.clock.now() - h.hold_time - self._suspended_total(h) > self.policy.approval_timeout
+        return h.approval_time is None and self.clock.now() - h.hold_time - self._suspended_total(h, h.hold_time) > self.policy.approval_timeout
 
     def _approval_expired(self, h: Hold) -> bool:
-        return h.approval_time is not None and self.clock.now() - h.approval_time - self._suspended_total(h) > self.policy.resume_window
+        return h.approval_time is not None and self.clock.now() - h.approval_time - self._suspended_total(h, h.approval_time) > self.policy.resume_window
 
     def _reopen_expired(self, run: Run, h: Hold) -> str:
         """If the window expires after an approval, the hold is re-opened with the same causes and the same
@@ -867,8 +913,9 @@ class RunCoordinator(Availability):
             self._transition(run, "STOPPING", "run.stopping", cause="stop", stop_ref=stop["stop_id"])
             for h in list(run.holds.values()):
                 if h.status in {"open", "approved"}:
-                    self._pep(run).cancel_pending(run, h.node_id)
-                    run.cancelled_effects.add(h.node_id)
+                    if h.kind == "effect":
+                        self._pep(run).cancel_pending(run, h.node_id)
+                        run.cancelled_effects.add(h.node_id)
                     h.status = "resolved"
                     self._invalidate_grant(run, h)
                     self._ev(run, {"type": "hold.resolved", "node_id": h.node_id, "outcome": "stopped", "approvers": [], "substitution": False})

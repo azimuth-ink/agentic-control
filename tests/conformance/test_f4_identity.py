@@ -51,8 +51,9 @@ def test_identity_is_issued_only_against_a_current_registry_entry(scenario):
     scenario.execute(run)
     # no credential is issued to a suspended identity: no model call, no effect; the run ends on its branches
     assert not scenario.systems["fulfilment"].shipments and not scenario.systems["mail_relay"].sent
-    assert {e["error"] for e in events(scenario, run, "effect.failed")} == {"revoked"}
+    assert {e["error"] for e in events(scenario, run, "effect.failed")} <= {"revoked"}
     assert run.state == "COMPLETED" and not events(scenario, run, "usage.recorded")
+    assert not any(c["payload"]["agent_id"] == AGENT and c["payload"]["issued_at"] >= run.started_at for c in scenario.platform.ids.issued)
 
 
 @spec("A.6", "4.4", finding="F4")

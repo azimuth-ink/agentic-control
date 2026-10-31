@@ -48,9 +48,12 @@ class System(Availability):
         elif c["purpose"] != "normal":
             raise SystemRefused("purpose not accepted")
 
-    def read(self, tool: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Default read: returns records whose key matches params. Items carry `tainted` from tags."""
+    def read(self, tool: str, params: dict[str, Any], credential: dict[str, Any] | None = None,
+             presenter: str | None = None) -> list[dict[str, Any]]:
+        """Default read: returns records whose key matches params. Items carry `tainted` from tags. A read
+        presents a credential like any other call (I1); the reference systems refuse one without."""
         self._check()
+        self._accept(credential, presenter or "", "normal", None)
         out = []
         for k, rec in self.records.items():
             if all(rec.get(p) == v for p, v in params.items() if p in rec):
@@ -86,7 +89,12 @@ class System(Availability):
     def apply(self, tool: str, params: dict[str, Any], tag: str | None) -> dict[str, Any]:
         raise NotImplementedError
 
-    def preview(self, params: dict[str, Any]) -> dict[str, Any]:
+    def preview(self, params: dict[str, Any], credential: dict[str, Any] | None = None, presenter: str | None = None) -> dict[str, Any]:
+        self._check()
+        self._accept(credential, presenter or "", "normal", None)
+        return self.preview_of(params)
+
+    def preview_of(self, params: dict[str, Any]) -> dict[str, Any]:
         return {"would_change": params}
 
     def write_record(self, key: str, rec: dict[str, Any], tag: str | None) -> None:
@@ -113,6 +121,7 @@ class MemoryStore(System):
 
     def execute(self, tool, params, credential, presenter, purpose="normal", action_hash=None, idempotency_key=None, tag=None):
         self._check()
+        self._accept(credential, presenter, purpose, action_hash)
         return self.apply(tool, params, tag)
 
 
@@ -134,6 +143,7 @@ class Interface(System):
 
     def execute(self, tool, params, credential, presenter, purpose="normal", action_hash=None, idempotency_key=None, tag=None):
         self._check()
+        self._accept(credential, presenter, purpose, action_hash)
         self.delivered.append({"recipient": params.get("recipient"), "content": params.get("content"), "tag": tag})
         return {"delivered_to": params.get("recipient")}
 
