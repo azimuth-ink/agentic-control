@@ -64,6 +64,7 @@ class SystemCapability(Record):
     sync: str = "event"                        # derived stores: event | scheduled
     feed_reviews: dict[str, bool] = field(default_factory=dict)  # source -> passed
     approved_by: tuple[str, ...] = ("security", "compliance")
+    endpoint: str | None = None                # one system is registered once: REG refuses a second registration of the same endpoint
 
 
 @dataclass
@@ -200,6 +201,10 @@ class Registry(Availability):
         for s in cap.sources:
             if s in self.systems and self.systems[s].kind == "sink_store" and cap.kind == "system_of_record":
                 raise Refused("a sink_store may not feed a system of record")
+        ep = cap.endpoint or cap.system_id
+        for other in self.systems.values():
+            if other.system_id != cap.system_id and (other.endpoint or other.system_id) == ep:
+                raise Refused(f"endpoint {ep} is already registered as {other.system_id}; one system is registered once, under one kind")
         if cap.system_id in self.systems:
             self._refuse_if_breaks_anchors(lambda: self._with_system(cap))
         self.systems[cap.system_id] = cap
