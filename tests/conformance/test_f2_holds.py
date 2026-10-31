@@ -4,7 +4,6 @@ suspend while parked; the re-hold maximum ends the cycle by denial."""
 import pytest
 
 from agentic_control.common import Refused
-from agentic_control.release import Bound
 from conftest import decisions, events, last_decision, spec
 from warranty import AGENT, BUILD, build_scenario, policy_values
 
@@ -120,7 +119,7 @@ def test_timers_suspend_while_parked_and_resume_after_recovery():
 def test_window_expiry_after_approval_while_parked_reopens_the_hold():
     sc, run = held_scenario()
     sc.platform.outage("IDS")
-    res = sc.platform.ops.approve(run, "n4", "approver-1")
+    sc.platform.ops.approve(run, "n4", "approver-1")
     # IDS unreachable at redemption: the PEP cannot get a credential and the run parks
     assert run.state == "PARKED"
     sc.platform.outage("IDS", down=False)

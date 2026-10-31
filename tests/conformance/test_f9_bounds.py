@@ -6,7 +6,7 @@ import pytest
 from agentic_control.common import Denied
 from agentic_control.release import Bound, Node
 from conftest import decisions, events, last_decision, spec
-from warranty import build_scenario, policy_values
+from warranty import build_scenario
 
 
 @spec("A.3", "A.1", finding="F9")

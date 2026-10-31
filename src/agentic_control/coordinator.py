@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .common import Availability, Clock, Denied, Refused, Unavailable, digest, new_id
+from .common import Availability, Clock, Denied, Refused, Unavailable, new_id
 from .crypto import Signer, TrustStore
 from .evidence import EvidenceStore
 from .identity import IdentityService

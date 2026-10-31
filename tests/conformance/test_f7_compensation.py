@@ -1,10 +1,9 @@
 """F7. Compensation: deterministic, from the manifest mapping over the recorded original call, verified
 against the evidence it is attached to, never held, outside stop scope; a failed or irreversible
 compensation parks; cancellation compensates in reverse order."""
-import pytest
 
-from conftest import decisions, events, last_decision, spec
-from warranty import build_scenario, policy_values
+from conftest import events, last_decision, spec
+from warranty import build_scenario
 
 
 def completed(**kw):
@@ -32,7 +31,6 @@ def test_compensation_parameters_come_only_from_the_recorded_call():
 @spec("A.3", finding="F7")
 def test_a_compensation_whose_parameters_differ_from_the_mapping_is_denied():
     sc, run = completed()
-    from agentic_control.policy import apply_mapping
     pdp = sc.platform.pdp
     orig_decide = pdp._decide_compensation
     seen = {}

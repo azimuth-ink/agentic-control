@@ -3,7 +3,7 @@ what stops; journals reconcile; parked runs recover; escalation and the OPS clos
 import pytest
 
 from agentic_control.common import Refused
-from conftest import decisions, events, last_decision, spec
+from conftest import events, last_decision, spec
 from warranty import build_scenario, policy_values
 
 

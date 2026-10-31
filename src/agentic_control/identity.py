@@ -6,10 +6,10 @@ identities. Issues every credential a PEP presents downstream: sender-constraine
 workload, audience-bound, with a purpose."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .common import Availability, Clock, Refused, digest, new_id
+from .common import Availability, Clock, Refused, new_id
 from .crypto import Sealer, Signer, TrustStore
 from .registry import PolicyValues, Registry
 

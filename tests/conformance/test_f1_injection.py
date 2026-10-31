@@ -6,7 +6,7 @@ import pytest
 from agentic_control.common import Refused
 from agentic_control.dbs import MemoryStore
 from agentic_control.registry import SystemCapability, ToolManifest
-from conftest import decisions, events, last_decision, spec
+from conftest import events, last_decision, spec
 from warranty import build_scenario
 
 
@@ -120,7 +120,6 @@ def test_a_child_run_returning_exposed_taints_the_parent():
 
 @spec("A.1", "A.5", finding="F1")
 def test_a_preview_of_an_untrusted_system_taints(scenario):
-    from agentic_control.registry import ToolManifest
     reg = scenario.platform.registry
     pt = reg.tools["preview_shipment"]
     assert reg.untrusted_source(pt) == "per_item"

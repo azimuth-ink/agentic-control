@@ -5,9 +5,8 @@ import pytest
 
 from agentic_control.common import Refused
 from agentic_control.dbs import SystemRefused
-from agentic_control.release import Release
-from conftest import decisions, events, last_decision, spec
-from warranty import AGENT, BUILD, build_scenario, policy_values
+from conftest import events, last_decision, spec
+from warranty import AGENT, build_scenario, policy_values
 
 
 @spec("A.6", "A.7", "1", finding="F4")

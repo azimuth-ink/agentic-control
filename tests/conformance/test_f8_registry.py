@@ -5,8 +5,8 @@ import pytest
 
 from agentic_control.common import Refused
 from agentic_control.registry import Agent, SystemCapability, ToolManifest
-from agentic_control.release import Bound, Node, Release
-from conftest import decisions, events, last_decision, spec
+from agentic_control.release import Release
+from conftest import events, last_decision, spec
 from warranty import AGENT, build_scenario, policy_values
 
 
@@ -36,7 +36,7 @@ def test_a_factored_effect_is_never_A3():
 def test_effect_without_compensation_or_with_a_wrong_compensate_node_is_refused(scenario):
     sc = scenario
     rel = sc.release
-    nodes = [n for n in rel.nodes]
+    [n for n in rel.nodes]
     n4 = rel.node("n4")
     n4.compensate = None
     assert any("compensate node or irreversible" in e for e in lint(sc, rel))

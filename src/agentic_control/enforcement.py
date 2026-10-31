@@ -8,10 +8,10 @@ updates run state at RUN before releasing a result. It holds the signed bundle a
 a signed local journal for degraded mode."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .common import Clock, Denied, Refused, Unavailable, digest, new_id
+from .common import Clock, Denied, Refused, Unavailable, digest
 from .coordinator import EffectRecord, Run, RunCoordinator
 from .crypto import TrustStore
 from .dbs import DLP, Indeterminate, System, SystemRefused

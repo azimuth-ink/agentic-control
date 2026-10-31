@@ -5,7 +5,7 @@ loop, effect and output nodes and never decides whether an effect happens; every
 the PEP. Holds stop the walk; the walk continues at the checkpointed next node after RUN resumes."""
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .common import Denied, Unavailable
 from .coordinator import Run, RunCoordinator

@@ -1,6 +1,6 @@
 """F3. Velocity: counters are reserved before the decision, released on deny or hold, confirmed on the
 effect event, reconciled from evidence; exposed runs halve the limits; the hard cap is a denial."""
-from conftest import decisions, events, last_decision, spec
+from conftest import events, last_decision, spec
 from warranty import build_scenario, policy_values
 
 
@@ -68,7 +68,7 @@ def test_exposed_runs_use_half_the_velocity_limit():
 @spec("4.6", "A.5", finding="F3")
 def test_counters_are_reconciled_from_evidence():
     sc = build_scenario(trigger="clean-ticket")
-    run = run_shipment(sc)
+    run_shipment(sc)
     rc = sc.platform.run
     rc.counters.clear()                              # RUN lost its in-memory counters
     assert rc.counter_count("agent", "warranty-agent") == 0

@@ -326,7 +326,7 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     release = Release(AGENT, "1.0", surface, form, "pep-1.0", nodes,
                       tools={n.tool: "1" for n in nodes if n.tool}, scopes={"templates": ["tpl-shipped", "tpl-denied"], "sinks": ["case-log"], "recipients": [], "topics": ["warranty"]},
                       model_route=["model-a"])
-    entitlements = {AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": [f"agent:triage-agent"]}}
+    entitlements = {AGENT: {"tools": [t for t in reg.tools], "systems": list(systems), "agents": ["agent:triage-agent"]}}
     if with_child:
         entitlements["triage-agent"] = {"tools": ["read_ticket"], "systems": ["support_portal"], "agents": []}
     bundle = PolicyBundle("1", policy, entitlements=entitlements, recipient_clearance={"cust-1": "confidential"})
