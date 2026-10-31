@@ -208,9 +208,10 @@ def build_scenario(behaviour: str = "normal", clock: Clock | None = None, policy
     `with_child` replaces the middle of the graph with a handoff to a triage agent; `trigger` selects the
     trigger the run starts from (fault-ticket, clean-ticket, console)."""
     clock = clock or Clock()
-    policy = policy or policy_values()
-    if regulated_irreversible:
-        policy.two_approver_threshold = 150.0
+    if policy is None:
+        policy = policy_values()
+        if regulated_irreversible:
+            policy.two_approver_threshold = 150.0
     boundary = Boundary(inside_systems={"support_portal", "device_registry", "fulfilment", "mail_relay", "identity_system", "case_log", "agent_memory", "notes", "console"},
                         resolvers={"postal_address": lambda v: False, "email": lambda v: str(v).endswith("@corp.internal")},
                         can_resolve_outside={"postal_address": True, "email": True})
