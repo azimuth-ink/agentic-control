@@ -68,17 +68,19 @@ def anchored_params(bounds: list[Bound], scope_names: set[str]) -> set[str]:
     already-anchored parameter. Other operators never anchor."""
     anchored: set[str] = set()
     for b in bounds:
-        if b.form == "anchor_rel" and b.anchor in ANCHORS | scope_names:
+        if b.form == "anchor_rel" and b.rel and b.anchor in ANCHORS | scope_names:
             anchored.add(b.param)
         elif b.form == "in_scope" and b.scope in scope_names:
             anchored.add(b.param)
-        elif b.form == "eq_rel_anchor" and b.anchor in ANCHORS | scope_names:
+        elif b.form == "eq_rel_anchor" and b.rel and b.anchor in ANCHORS | scope_names:
             anchored.add(b.param)
+        elif b.form == "eq_anchor" and b.anchor in ANCHORS | scope_names:
+            anchored.add(b.param)        # p == acting_user, the output-node form the text names
     changed = True
     while changed:
         changed = False
         for b in bounds:
-            if b.form == "eq_rel_param" and b.q in anchored and b.param not in anchored:
+            if b.form == "eq_rel_param" and b.rel and b.q in anchored and b.param not in anchored:
                 anchored.add(b.param)
                 changed = True
     return anchored

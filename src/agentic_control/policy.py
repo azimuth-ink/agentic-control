@@ -342,6 +342,9 @@ class PolicyDecisionPoint(Availability):
                 elif b.form == "in_scope":
                     if p.get(b.param) not in (rq.release.scopes.get(b.scope) or []):
                         return f"{b.param} not in scope {b.scope}"
+                elif b.form == "eq_anchor":
+                    if p.get(b.param) != self._anchor_value(rq, b.anchor):
+                        return f"{b.param} != {b.anchor}"
                 elif b.form == "eq_rel_anchor":
                     if p.get(b.param) != self._pip().relation(b.rel, self._anchor_value(rq, b.anchor)):
                         return f"{b.param} != {b.rel}({b.anchor})"

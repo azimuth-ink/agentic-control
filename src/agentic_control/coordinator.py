@@ -430,7 +430,10 @@ class RunCoordinator(Availability):
         # a RUN that lost its windows rebuilds them from the executed effects' recorded keys
         for rid in executed_rids:
             e = by_rid[rid]
-            keys = e.get("reservation_keys") or {}
+            try:
+                keys = self.evs.payloads.get(e["reservation_keys_ref"]) if e.get("reservation_keys_ref") else {}
+            except KeyError:
+                keys = {}
             if not keys or e.get("timestamp", now) <= now - COUNTER_WINDOW:
                 continue
             present = any(x["rid"] == rid for lst in self.counters.values() for x in lst)
@@ -752,8 +755,14 @@ class RunCoordinator(Availability):
         if outcome == "executed":
             self._ev(run, {"type": "effect.executed", "node_id": node_id, "purpose": "normal", "credential_presentation": presentation,
                            "result_ref": evidence_ref, "recorded_by": "resolver", "resolver": resolver, "action_hash": ah})
+            params = {}
+            if decisions:
+                try:
+                    params = dict(self.evs.payloads.get(decisions[-1]["parameters_ref"]))
+                except KeyError:
+                    params = {}
             self.effect_confirmed(run, EffectRecord(node_id, ah, decisions[-1]["event_id"] if decisions else "",
-                                                    decisions[-1].get("parameters", {}) if decisions else {}, result_fields or {},
+                                                    params, result_fields or {},
                                                     evidence_ref, [], tool.tool_id))
             self._node_resolved_executed(run, node_id, result_fields or {})
         else:

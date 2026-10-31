@@ -13,7 +13,7 @@ Reference implementation of the Agentic Control Architecture v1.0 (internal spec
 - RUN: hooks and checkpoints, counters (reserve/release/confirm/reconcile), holds with grants and substitution, parks and recovery with timer suspension, effects in doubt with bounded replay and resolver outcomes, stops, escalation and the OPS close on the owner's deadline, child runs.
 - The PEP's per-call duties and degraded modes (ADR 0004); deliveries with the rendering sanitizer; spawns; RUN-instructed previews, resumes, compensations and replays.
 - The section-8 warranty flow as a runnable example with adversarial model behaviours and graph variants.
-- Conformance suite F1–F9 plus review regressions (134 tests) with `@spec` markers; unit tests (20); `tools/conformance_report.py --check` in CI.
+- Conformance suite F1–F9 plus two rounds of review regressions (153 tests) with `@spec` markers; unit tests (21); `tools/conformance_report.py --check` in CI.
 
 ### Found by the conformance suite and fixed before this version
 - A replacement PEP recomputed parameter provenance from a process-local set and so held an already-sanitized parameter for exposure; provenance is now rebuilt from the run's `sanitize.result` evidence.
@@ -52,6 +52,16 @@ Reference implementation of the Agentic Control Architecture v1.0 (internal spec
 - Suspended time before an approval was credited against the resume window (RUN and IDS).
 - The PDP honoured `causes_discharged` from an unverified approval record; the record must verify under RUN's key for the same action hash.
 - A missing rendering sanitizer raised `StopIteration`; a stop cancelled input holds with an `effect.failed`; a preview failing on an outage broke the hold.
+
+### Found by the second independent code review and fixed before this version
+- The runtime held the control plane: it was handed `RunCoordinator` and the live `Run`, the PEP evaluated node objects the runtime supplied (a forged node with a real id and no bounds read another customer's record), `checkpoint` accepted any branch, `pep.instruct` and the resolver, owner and human-input entry points were callable by anyone. Now the PEP resolves the run from RUN and the node from the release; branches are validated against the declaration; instructions are RUN-signed and single-use; the runtime gets only a PEP; resolvers, owners and human-input roles act through OPS with identity-provider assertions RUN verifies.
+- IDS trusted the caller's principal chain and ignored revocation: it now keeps the run's delegation state (`exchange(session, run)`, children through `exchange_child`), refuses a chain naming a user the run has no delegation from, refuses issuance for a build removed from the allow-list, rejects credentials of revoked runs and agents at verification, and writes no standing delegation for a substituting approver.
+- A NaN or absent `amount` passed every limit (NaN compares false); the extractor rejects non-finite numbers, every schema parameter must be present, and a limit over a non-finite value is a denial.
+- Personal data was inline in chained events (`parameters`, `reservation_keys`) and payload references were plain hashes; parameters and reservation keys now live only in the erasable payload store, referenced by HMAC under a store key.
+- Taint: an untagged field from a provenance-tagged trigger or record was treated as clean; what an effect or memory write returns bypassed the source rule; sanitized provenance was granted to undeclared output fields; only `content` passed the rendering sanitizer on delivery; a child's data classes did not return. All fixed.
+- The example diverged from section 8: a tagging system's write ignored the tag and replaced the record (now merge-on-write, tagging only the fields written); a denied shipment sent the "shipped" reply (now routes to a person with its own template, via an explicit `next` on nodes); `address_on_file` answered from an unverified field.
+- Linter: loop caps required; effect, output and compensate nodes name exactly one tool; a compensate node's tool must be the mapped reversing tool and `reverses` an effect node; handoff tools are `agent:<target>`; relation-less or unknown-anchor bounds refused and anchor nothing; the `p == acting_user` output form (`eq_anchor`); stores are never the target of a side-effect tool; a new registration that would remove a published anchor is refused rather than applied-then-suspended; derived classes carry no `irreversible` factor.
+- Evidence: `node.entered.inputs_ref` carries the run's recorded outputs and taint rather than a runtime claim; a normal effect decision must carry its reservation (central, or `local` under a RUN outage); the journal is cleared only after its entries are in the chain and each entry must verify under the journal's own key; a compensation whose credential was refused or unavailable records nothing.
 
 ### Known gaps (deferred with the specification's v1.1 list, section 11)
 - `approval_records[]` in the IDS contract and the two-approver substitution rule.
