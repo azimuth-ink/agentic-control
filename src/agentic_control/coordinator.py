@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 TERMINAL = {"COMPLETED", "COMPENSATED", "CANCELLED", "FAILED", "CLOSED_WITH_EXCEPTION"}
 
 
+COUNTER_WINDOW = 3600.0
+
+
 @dataclass
 class Hold:
     hold_id: str
@@ -158,6 +161,8 @@ class RunCoordinator(Availability):
             return pep.journal.append(ev)["event_id"]
 
     def _transition(self, run: Run, state: str, event: str, **fields: Any) -> None:
+        if state == "RUNNING" and run.state != "RUNNING":
+            run.last_heartbeat = self.clock.now()   # the host-lost timer runs from the return to RUNNING
         run.state = state
         self._ev(run, {"type": event, **fields})
 
@@ -361,9 +366,11 @@ class RunCoordinator(Availability):
         to the decision's reservation id, at the end of each window and whenever a resolver records an outcome."""
         executed_rids: set[str] = set()
         decision_rid: dict[str, str] = {}
+        by_rid: dict[str, dict[str, Any]] = {}
         for e in self.evs.events:
             if e.get("type") == "decision" and e.get("reservation_id"):
                 decision_rid[e["action_hash"]] = e["reservation_id"]
+                by_rid[e["reservation_id"]] = e
         for e in self.evs.events:
             if e.get("type") == "effect.executed" and e.get("action_hash") in decision_rid:
                 executed_rids.add(decision_rid[e["action_hash"]])
@@ -375,13 +382,27 @@ class RunCoordinator(Availability):
                     self.confirm(rid); fixed += 1
                 elif now - r["t"] > r["window"]:
                     r["status"] = "expired"
+        # a RUN that lost its windows rebuilds them from the executed effects' recorded keys
+        for rid in executed_rids:
+            e = by_rid[rid]
+            keys = e.get("reservation_keys") or {}
+            if not keys or e.get("timestamp", now) <= now - COUNTER_WINDOW:
+                continue
+            present = any(x["rid"] == rid for lst in self.counters.values() for x in lst)
+            if present:
+                continue
+            for kind, key in keys.items():
+                self.counters.setdefault(f"{kind}:{key}", []).append({"t": e["timestamp"], "rid": rid, "status": "confirmed"})
+            self.reservations.setdefault(rid, {"keys": keys, "window": COUNTER_WINDOW, "status": "confirmed", "t": e["timestamp"]})
+            fixed += 1
         return fixed
 
     def counter_count(self, kind: str, key: str) -> int:
         return len([x for x in self.counters.get(f"{kind}:{key}", []) if x["status"] != "released"])
 
     # ------------------------------------------------------------------ holds (A.5, A.2)
-    def hold(self, run: Run, node: Node, decision: Any, pending: dict[str, Any], action_hash: str) -> Hold:
+    def hold(self, run: Run, node: Node, decision: Any, pending: dict[str, Any], action_hash: str,
+             substitution_only: bool = False) -> Hold:
         self._check()
         now = self.clock.now()
         existing = run.holds.get(node.id)
@@ -389,12 +410,14 @@ class RunCoordinator(Availability):
         h = Hold(hold_id=new_id("hold"), node_id=node.id, action_hash=action_hash, kind="effect",
                  causes=list(decision.hold_causes), approver_set=list(decision.approver_set),
                  approvers_required=decision.approvers_required, hold_time=now,
-                 substitution_only=False, discharged=set(discharged), pending=pending)
+                 substitution_only=substitution_only, discharged=set(discharged), pending=pending)
         if existing and existing.grant_id:
             self._invalidate_grant(run, existing)
         anchored_to_user = any(b.anchor == "acting_user" for b in node.bounds)
         try:
-            if self.policy.grants_permitted and not anchored_to_user:
+            if substitution_only:
+                pass                      # no grant: the approver's own authority completes the action
+            elif self.policy.grants_permitted and not anchored_to_user:
                 h.grant_id, h.grant_token = self.ids.mint_resumption_grant(run.run_id, node.id, action_hash, run.agent_id)
                 self._ev(run, {"type": "grant.minted", "grant_id": h.grant_id, "action_hash": action_hash})
             elif self.policy.grants_permitted:
@@ -409,8 +432,8 @@ class RunCoordinator(Availability):
                 h.substitution_only = True
             else:
                 run.holds[node.id] = h
-                run.held_before_park = True
                 self._park(run, "IDS unreachable at hold", recoverable=True)
+                run.held_before_park = True
                 h.timers_suspended_since = now
                 return h
         run.holds[node.id] = h
@@ -485,8 +508,14 @@ class RunCoordinator(Availability):
         if len(h.approvals) < h.approvers_required:
             return {"status": "awaiting_second_approver"}
         h.approval_time = self.clock.now()
-        status = self.ids.delegation_status(run.acting_user)
-        if run.acting_user is not None and status != "valid":
+        status = "none"
+        ids_unreachable = False
+        if run.acting_user is not None:
+            try:
+                status = self.ids.delegation_status(run.acting_user)
+            except Unavailable:
+                ids_unreachable = True     # the approval is recorded; redemption will check the delegation
+        if run.acting_user is not None and not ids_unreachable and status != "valid":
             if self.policy.substitution_permitted and not any(b.anchor == "acting_user" for b in run.release.node(node_id).bounds):
                 h.record_kind = "substitution"
             else:
@@ -509,7 +538,14 @@ class RunCoordinator(Availability):
                        "causes_remaining": [], "substitution": h.record_kind == "substitution"})
         if run.state == "HELD":
             self._transition(run, "RUNNING", "run.resumed", cause="approved")
-            return self._pep(run).instruct(run, node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
+            try:
+                return self._pep(run).instruct(run, node_id, "resume", approval_ref=h.approval_record, grant=h.grant_token)
+            except Unavailable as e:
+                # the approval stands; the resume is retried on recovery with the record (6.1)
+                self._park(run, f"{e.component} unreachable at resume", recoverable=True)
+                run.held_before_park = True
+                h.timers_suspended_since = self.clock.now()
+                return {"status": "approved_while_parked"}
         return {"status": "approved_while_parked"}
 
     def _deny_hold(self, run: Run, h: Hold, outcome: str) -> dict[str, Any]:
@@ -555,9 +591,7 @@ class RunCoordinator(Availability):
             self._transition(run, "RUNNING", "run.resumed", cause="denial_branch")
             self._follow_branch(run, node.id, "denial")
             raise Denied("re-hold maximum")
-        h = self.hold(run, node, d, pending, action_hash)
-        h.substitution_only = True
-        return h
+        return self.hold(run, node, d, pending, action_hash, substitution_only=True)
 
     def approved_action_used(self, run: Run, node_id: str, event: str) -> None:
         """The approved-action record is invalidated on effect.executed, effect.failed, a later hold or

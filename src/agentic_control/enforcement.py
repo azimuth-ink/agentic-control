@@ -182,9 +182,30 @@ class EnforcementPoint:
             return "p:" + digest(obj)
 
     # ------------------------------------------------------------------ per-call duties
+    def _accepted(self, run: Run) -> set[str]:
+        """Values a qualifying sanitizer accepted in this run. A replacement PEP has no local record and
+        rebuilds the set from the run's sanitize.result events (the accepted payload is evidence, 5.3)."""
+        acc = self.sanitized.get(run.run_id)
+        if acc is None:
+            acc = set()
+            for e in self._evidence(run):
+                if e.get("type") != "sanitize.result":
+                    continue
+                s = self.registry.sanitizers.get(e.get("sanitizer", ""))
+                if s is None or not s.qualifies_for_sanitized_provenance:
+                    continue
+                try:
+                    payload = self.evs.payloads.get(e["accepted_ref"])
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    acc |= {digest(v) for v in payload.values()}
+            self.sanitized[run.run_id] = acc
+        return acc
+
     def _provenance(self, run: Run, node: Node, m: ToolManifest, params: dict[str, Any]) -> dict[str, str]:
         out: dict[str, str] = {}
-        accepted = self.sanitized.get(run.run_id, set())
+        accepted = self._accepted(run)
         for p, v in params.items():
             if node.template_param == p and v in (run.release.scopes.get("templates") or []):
                 out[p] = "template"
@@ -219,14 +240,14 @@ class EnforcementPoint:
             rehold_count=run.rehold_counts.get(self._action_hash(m, params, run, node.id), 0),
             destination_outside=self.registry.destination_outside(m, params), preview_instructed=preview_instructed)
 
-    def _decide(self, rq: DecisionRequest, run: Run) -> Decision:
+    def _decide(self, rq: DecisionRequest, run: Run, counted_locally: bool = False) -> Decision:
         """Submit to the PDP; on a PDP outage, local evaluation of the cached bundle for what 6.1 allows."""
         try:
             return self.pdp.decide(rq)
         except Unavailable:
-            return self._local_decide(rq, run)
+            return self._local_decide(rq, run, counted_locally)
 
-    def _local_decide(self, rq: DecisionRequest, run: Run) -> Decision:
+    def _local_decide(self, rq: DecisionRequest, run: Run, counted_locally: bool = False) -> Decision:
         """Degraded mode against the PDP (6.1): scope-anchored no-factor effects on runs neither exposed
         nor delegated continue on the cached bundle until the stop list is stale; compensation and replay
         continue; everything else stops."""
@@ -255,11 +276,12 @@ class EnforcementPoint:
             if b.form == "limit" and b.auto is not None and rq.parameters.get(b.param, 0) > b.auto:
                 raise Unavailable("PDP")   # a hold cannot be processed locally
         cap = self.bundle.values.degraded_caps.get("effects_per_pep", 10)
-        self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
+        if not counted_locally:
+            self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
+            if self.journal:
+                self.journal.local_counters["effects"] = self.local_counters["effects"]
         if self.local_counters["effects"] > cap:
             return Decision("DENY", "degraded_cap", "degraded-mode cap reached")
-        if self.journal:
-            self.journal.local_counters["effects"] = self.local_counters["effects"]
         return Decision("ALLOW", "local_bundle", None, [], [], False, ["evidence_first"])
 
     def _decision_event(self, run: Run, node: Node, rq: DecisionRequest, d: Decision, reservation: str | None,
@@ -267,10 +289,11 @@ class EnforcementPoint:
         ev = {"type": "decision", "node_id": node.id, "purpose": rq.purpose, "tool": rq.tool.tool_id, "version": rq.tool.version,
               "schema_hash": rq.tool.schema_hash, "parameters_ref": self._payload(rq.parameters), "parameters": rq.parameters,
               "parameter_roles": rq.tool.parameter_roles, "action_hash": rq.action_hash, "factors": sorted(rq.factors),
-              "tier": node.tier, "decision": d.result, "rule_id": d.rule_id, "obligations": d.obligations,
+              "tier": node.tier, "decision": d.result, "rule_id": d.rule_id, "reason": d.reason, "obligations": d.obligations,
               "stop_list_seq": rq.stop_list_seq, "provenance": rq.provenance}
         if reservation:
             ev["reservation_id"] = reservation; ev["counters_snapshot"] = counters
+            ev["reservation_keys"] = self._keys(run, rq.tool, rq.parameters)
         if idem:
             ev["idempotency_key"] = idem
         if approval_ref:
@@ -398,16 +421,23 @@ class EnforcementPoint:
         keys = self._keys(run, m, params)
         counters: dict[str, int] = {}
         reservation: str | None = None
+        counted_locally = False
         try:
             reservation, counters = self.run.reserve(keys, COUNTER_WINDOW)
         except Unavailable:
             if self.form == "proxy":
                 raise
-            # RUN down: PEP-E local counters with tighter caps
+            # RUN down: PEP-E local counters with the degraded cap (6.1)
+            counted_locally = True
             self.local_counters["effects"] = self.local_counters.get("effects", 0) + 1
             counters = {k: self.local_counters["effects"] for k in keys}
+            if self.journal:
+                self.journal.local_counters["effects"] = self.local_counters["effects"]
         rq = self._request(run, node, m, params, "normal", counters, approval_ref=approval_ref)
-        d = self._decide(rq, run)
+        if counted_locally and self.bundle and self.local_counters["effects"] > self.bundle.values.degraded_caps.get("effects_per_pep", 10):
+            d = Decision("DENY", "degraded_cap", "degraded-mode cap reached")
+        else:
+            d = self._decide(rq, run, counted_locally)
         if d.result == "DENY":
             self._decision_event(run, node, rq, d, reservation, counters, None, approval_ref and approval_ref["payload"]["approval_ref"])
             if reservation:
@@ -455,6 +485,17 @@ class EnforcementPoint:
         except Refused as e:
             if "revoked" in str(e) or (approval_ref is not None):
                 return self._revoked_at_redemption(run, node, m, params, rq, reservation, presentation)
+            # any other IDS refusal (identity lapsed, workload unbound, form mismatch): no credential, no call
+            self._write(run, {"type": "effect.failed", "node_id": node.id, "purpose": "normal", "credential_presentation": presentation,
+                              "error": "revoked", "detail": str(e), "recorded_by": "pep", "action_hash": rq.action_hash})
+            if reservation:
+                self.run.release(reservation)
+            self.run.approved_action_used(run, node.id, "failed")
+            self._failed(run, node)
+            raise NodeFailed(f"credential refused: {e}")
+        except Unavailable:
+            if reservation:
+                self.run.release(reservation)
             raise
         if cred is None:
             return self._revoked_at_redemption(run, node, m, params, rq, reservation, presentation)
@@ -584,7 +625,11 @@ class EnforcementPoint:
         if (run.run_id, node.id) in self.capped_nodes:
             raise Denied("cap_reached: the PEP refuses the node's next model credential")
         release = {"agent_id": run.release.agent_id, "version": run.release.version, "surface": run.release.surface, "pep_form": run.release.pep_form}
-        cred = self.ids.issue_credential(self.workload, run.run_id, release, node.id, {}, run.principal_chain, "MGW", "model")
+        try:
+            cred = self.ids.issue_credential(self.workload, run.run_id, release, node.id, {}, run.principal_chain, "MGW", "model")
+        except Refused as e:
+            self.cap_reached(run, node.id)      # no model credential: the node makes no further model calls
+            raise Denied(f"model credential refused: {e}")
         text, cap = self.mgw.complete(cred, self.workload, run, node.id, model, prompt, tokens)
         if cap:
             self.cap_reached(run, node.id)
